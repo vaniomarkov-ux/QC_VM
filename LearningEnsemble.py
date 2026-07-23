@@ -220,7 +220,7 @@ class QuantumDecoder(nn.Module):
         U = A @ inv_sqrt
         return U
     
-    def get_coisometry(self):
+    def get_coisometry0(self):
         V = torch.complex(self.V_re, self.V_im)
         G = V.conj().T @ V
         G = 0.5 * (G + G.conj().T)
@@ -231,6 +231,43 @@ class QuantumDecoder(nn.Module):
         
         V_normalized = V @ inv_sqrt
         return V_normalized
+    
+    def get_coisometry(self):
+        """
+        Return V_iso with V_iso.conj().T @ V_iso = I.
+    
+        Shape:
+            V_iso: [d_in, d_out]
+        """
+    
+        V = torch.complex(self.V_re, self.V_im)
+    
+        if not torch.isfinite(V.real).all() or not torch.isfinite(V.imag).all():
+            raise FloatingPointError("Non-finite entries found in decoder V.")
+    
+        # QR is more stable than eigendecomposition of V†V.
+        Q, R = torch.linalg.qr(V, mode="reduced")
+    
+        # Q has shape [d_in, d_out] and Q†Q = I.
+        return Q    
+
+    def get_coisometry1(self):
+        """
+        SVD/polar version.
+        Produces V_iso with V_iso.conj().T @ V_iso = I.
+        """
+    
+        V = torch.complex(self.V_re, self.V_im)
+    
+        if not torch.isfinite(V.real).all() or not torch.isfinite(V.imag).all():
+            raise FloatingPointError("Non-finite entries found in decoder V.")
+    
+        U, S, Vh = torch.linalg.svd(V, full_matrices=False)
+    
+        V_iso = U @ Vh
+    
+        return V_iso
+
     
     def _normalize_density_matrix(self, rho_batch):
         """
@@ -3272,9 +3309,9 @@ if __name__ == "__main__" and mode == 'train':
             target_distributions=target_dists,
             global_weights=global_weights,
             d_out=3,
-            batch_size=16, #8192,
-            lr=5e-3,
-            epochs=200,
+            batch_size=256+128,
+            lr=1e-3,   # 5e-3, too high causing convergence problems?
+            epochs=5, #200,
             freeze_encoders=True,      # Keep pretrained encoders fixed
             freeze_decoder=False,      # Train decoder
             device  = "cuda" if torch.cuda.is_available() else "cpu",
