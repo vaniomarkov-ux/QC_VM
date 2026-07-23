@@ -12,7 +12,8 @@ import sys
 import numpy as np
 from typing import Literal, Optional, Tuple, List
 from collections import OrderedDict
-
+import os
+from datetime import datetime
 torch.set_num_threads(4)
 torch.set_num_interop_threads(1)
 from plot_distributions import plotDistribution, plotDistributions
@@ -1153,6 +1154,175 @@ class MultiEncoderQuantumEnsemble(nn.Module):
             print("-" * 40)
     
         return info            
+#------------------------------------------------------------------------------
+# Get prediction from multi encoder quantum ensemble
+#------------------------------------------------------------------------------
+def _extract_distribution_from_model_output(output):
+    """
+    Robustly extract predicted class distributions from model output.
+
+    Supports:
+        output = tensor [B, C]
+        output = (tensor [B, C], ...)
+        output = {"pred_dist": tensor [B, C], ...}
+        output = {"probs": tensor [B, C], ...}
+    """
+
+    if isinstance(output, dict):
+        for key in [
+            "pred_dist",
+            "prediction",
+            "predictions",
+            "probs",
+            "probabilities",
+            "p_pred",
+            "class_probs",
+        ]:
+            if key in output:
+                return output[key]
+
+        raise KeyError(
+            "Could not find prediction distribution in model output dict."
+        )
+
+    if isinstance(output, (tuple, list)):
+        return output[0]
+
+    return output
+
+
+def get_ensemble_predictions_ordered(
+    ensemble_model,
+    sequences_list,
+    batch_size: int = 512,
+    device: str = "cpu",
+    class_values=(-1, 0, 1),
+    eps: float = 1e-12,
+):
+    """
+    Ordered predictions for a MultiEncoderQuantumEnsemble.
+
+    Parameters
+    ----------
+    ensemble_model:
+        Trained MultiEncoderQuantumEnsemble.
+
+    sequences_list:
+        Encoder-major list:
+
+            sequences_list[m][j]
+
+        where m is the encoder/channel index and j is the example index.
+
+        This should usually be:
+
+            flat_training_data["X_by_channel"]
+
+    batch_size:
+        Micro-batch size.
+
+    device:
+        "cpu" or "cuda".
+
+    class_values:
+        Class labels corresponding to output columns.
+        Default order is (-1, 0, 1).
+
+    Returns
+    -------
+    result:
+        {
+            "pred_distributions": np.ndarray [N, d_out],
+            "pred_classes": np.ndarray [N],
+            "class_values": np.ndarray
+        }
+    """
+
+    ensemble_model = ensemble_model.to(device)
+    ensemble_model.eval()
+
+    n_encoders = len(sequences_list)
+
+    if n_encoders == 0:
+        raise ValueError("sequences_list is empty.")
+
+    N = len(sequences_list[0])
+
+    for m in range(n_encoders):
+        if len(sequences_list[m]) != N:
+            raise ValueError(
+                f"Encoder {m} has {len(sequences_list[m])} examples, "
+                f"but encoder 0 has {N}."
+            )
+
+    class_values = np.asarray(class_values)
+
+    pred_blocks = []
+
+    with torch.no_grad():
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+
+            # Encoder-major batch:
+            # batch_sequences[m][b] is sequence for encoder m, batch example b.
+            batch_sequences = [
+                sequences_list[m][start:end]
+                for m in range(n_encoders)
+            ]
+
+            # Depending on your ensemble forward signature, one of these
+            # should work. The first is the expected call.
+            try:
+                output = ensemble_model(
+                    batch_sequences,
+                    device=device,
+                )
+            except TypeError:
+                output = ensemble_model(
+                    batch_sequences,
+                )
+
+            pred_dist = _extract_distribution_from_model_output(output)
+
+            if not torch.is_tensor(pred_dist):
+                pred_dist = torch.as_tensor(
+                    pred_dist,
+                    dtype=torch.float32,
+                    device=device,
+                )
+
+            # Ensure real probability tensor.
+            if torch.is_complex(pred_dist):
+                pred_dist = pred_dist.real
+
+            pred_dist = pred_dist.detach()
+
+            # Defensive normalization.
+            pred_dist = torch.clamp(pred_dist, min=eps)
+            pred_dist = pred_dist / pred_dist.sum(
+                dim=1,
+                keepdim=True,
+            )
+
+            pred_blocks.append(
+                pred_dist.cpu().numpy()
+            )
+
+    pred_distributions = np.concatenate(
+        pred_blocks,
+        axis=0,
+    )
+
+    pred_classes = class_values[
+        np.argmax(pred_distributions, axis=1)
+    ]
+
+    return {
+        "pred_distributions": pred_distributions.astype(np.float32),
+        "pred_classes": pred_classes,
+        "class_values": class_values,
+    }
+
 #------------------------------------------------------------------------------
 class MultiEncoderDataset(Dataset):
     """Dataset for multi-encoder ensemble"""
@@ -2375,6 +2545,306 @@ def compute_prediction_agreement(
         'detailed_results': detailed_results,
     }
 #------------------------------------------------------------------------------
+# Prediction Agreements - Ensemble
+
+def compute_ensemble_prediction_agreement(
+    sequences,
+    emp_target_dists,
+    mod_target_dists,
+    class_values=(-1, 0, 1),
+    class_names=None,
+    weights=None,
+    counts=None,
+    seq_lengths=None,
+    eps=1e-12,
+):
+    """
+    Compute dominant-class agreement between empirical and model distributions.
+
+    Works for both:
+
+        single-channel sequences:
+            sequences[j] = [a_1, ..., a_L]
+
+        ensemble sequences:
+            sequences[j] = [
+                [a_1^(0), ..., a_L^(0)],
+                [a_1^(1), ..., a_L^(1)],
+                ...
+            ]
+
+    Parameters
+    ----------
+    sequences:
+        Example-major list. For ensemble:
+            sequences[j][m][t]
+
+    emp_target_dists:
+        Empirical class distributions, shape [N, C].
+
+    mod_target_dists:
+        Model class distributions, shape [N, C].
+
+    class_values:
+        Class labels corresponding to distribution columns.
+        Default:
+            [-1, 0, 1]
+
+    class_names:
+        Optional names aligned with class_values.
+        Default:
+            {-1: "Down", 0: "Neutral", 1: "Up"}
+
+    weights:
+        Training weights, shape [N].
+        Usually flat_training_data["weights"].
+
+    counts:
+        Empirical occurrence counts, shape [N].
+        Usually flat_training_data["counts"].
+
+    seq_lengths:
+        Optional explicit sequence lengths.
+        Usually flat_training_data["seq_lengths"].
+
+    Returns
+    -------
+    Dictionary with agreement, per-class agreement, per-length agreement,
+    weighted agreement, and confusion matrices.
+    """
+
+    emp_target_dists = np.asarray(emp_target_dists, dtype=np.float64)
+    mod_target_dists = np.asarray(mod_target_dists, dtype=np.float64)
+
+    N = len(sequences)
+
+    assert emp_target_dists.shape[0] == N
+    assert mod_target_dists.shape[0] == N
+
+    class_values = np.asarray(class_values)
+
+    if class_names is None:
+        class_name_map = {
+            -1: "Down",
+             0: "Neutral",
+             1: "Up",
+        }
+    elif isinstance(class_names, dict):
+        class_name_map = class_names
+    else:
+        class_name_map = {
+            int(label): name
+            for label, name in zip(class_values, class_names)
+        }
+
+    n_classes = len(class_values)
+
+    # Dominant empirical and model classes
+    emp_idx = np.argmax(emp_target_dists, axis=1)
+    mod_idx = np.argmax(mod_target_dists, axis=1)
+
+    emp_classes = class_values[emp_idx]
+    mod_classes = class_values[mod_idx]
+
+    agreements = emp_idx == mod_idx
+
+    # Infer sequence lengths if not given explicitly.
+    if seq_lengths is None:
+        seq_lengths = []
+
+        for seq in sequences:
+            # Ensemble case: seq = [[...], [...], ...]
+            if len(seq) > 0 and isinstance(seq[0], (list, tuple, np.ndarray)):
+                seq_lengths.append(len(seq[0]))
+            else:
+                # Single-channel case: seq = [...]
+                seq_lengths.append(len(seq))
+
+        seq_lengths = np.asarray(seq_lengths, dtype=np.int64)
+    else:
+        seq_lengths = np.asarray(seq_lengths, dtype=np.int64)
+
+    # Normalize optional weights
+    if weights is not None:
+        weights = np.asarray(weights, dtype=np.float64)
+        weights = weights / (weights.sum() + eps)
+
+    if counts is not None:
+        counts = np.asarray(counts, dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Overall agreement
+    # ------------------------------------------------------------------
+    total = N
+    n_agree = int(agreements.sum())
+
+    agreement_pct = 100.0 * n_agree / max(total, 1)
+
+    result = {
+        "agreement_pct": agreement_pct,
+        "agreements": n_agree,
+        "total": total,
+
+        "emp_classes": emp_classes,
+        "mod_classes": mod_classes,
+        "agreements_mask": agreements,
+
+        "agreement_pct_by_class": {},
+        "agreements_by_class": {},
+        "totals_by_class": {},
+
+        "agreement_pct_by_length": {},
+        "agreements_by_length": {},
+        "totals_by_length": {},
+
+        "class_values": class_values,
+        "class_names": class_name_map,
+    }
+
+    # ------------------------------------------------------------------
+    # Training-weighted and occurrence-weighted overall agreement
+    # ------------------------------------------------------------------
+    if weights is not None:
+        result["weighted_agreement_pct"] = float(
+            100.0 * np.sum(weights * agreements)
+        )
+
+    if counts is not None:
+        result["count_weighted_agreement_pct"] = float(
+            100.0
+            * np.sum(counts * agreements)
+            / max(counts.sum(), eps)
+        )
+
+    # ------------------------------------------------------------------
+    # Agreement by empirical dominant class
+    # ------------------------------------------------------------------
+    for label in class_values:
+        label = int(label)
+        name = class_name_map.get(label, str(label))
+
+        mask = emp_classes == label
+
+        total_c = int(mask.sum())
+        agree_c = int(agreements[mask].sum())
+
+        pct_c = 100.0 * agree_c / max(total_c, 1)
+
+        result["agreement_pct_by_class"][name] = pct_c
+        result["agreements_by_class"][name] = agree_c
+        result["totals_by_class"][name] = total_c
+
+        if weights is not None:
+            w_c = weights[mask]
+            result.setdefault(
+                "weighted_agreement_pct_by_class",
+                {},
+            )[name] = float(
+                100.0
+                * np.sum(w_c * agreements[mask])
+                / max(w_c.sum(), eps)
+            )
+
+        if counts is not None:
+            c_c = counts[mask]
+            result.setdefault(
+                "count_weighted_agreement_pct_by_class",
+                {},
+            )[name] = float(
+                100.0
+                * np.sum(c_c * agreements[mask])
+                / max(c_c.sum(), eps)
+            )
+
+    # ------------------------------------------------------------------
+    # Agreement by sequence length
+    # ------------------------------------------------------------------
+    for L in sorted(np.unique(seq_lengths)):
+        mask = seq_lengths == L
+
+        total_L = int(mask.sum())
+        agree_L = int(agreements[mask].sum())
+
+        pct_L = 100.0 * agree_L / max(total_L, 1)
+
+        result["agreement_pct_by_length"][int(L)] = pct_L
+        result["agreements_by_length"][int(L)] = agree_L
+        result["totals_by_length"][int(L)] = total_L
+
+        if weights is not None:
+            w_L = weights[mask]
+            result.setdefault(
+                "weighted_agreement_pct_by_length",
+                {},
+            )[int(L)] = float(
+                100.0
+                * np.sum(w_L * agreements[mask])
+                / max(w_L.sum(), eps)
+            )
+
+        if counts is not None:
+            c_L = counts[mask]
+            result.setdefault(
+                "count_weighted_agreement_pct_by_length",
+                {},
+            )[int(L)] = float(
+                100.0
+                * np.sum(c_L * agreements[mask])
+                / max(c_L.sum(), eps)
+            )
+
+    # ------------------------------------------------------------------
+    # Confusion matrices
+    # Rows = empirical class, columns = model class.
+    # ------------------------------------------------------------------
+    label_to_index = {
+        int(label): i
+        for i, label in enumerate(class_values)
+    }
+
+    confusion_unique = np.zeros(
+        (n_classes, n_classes),
+        dtype=np.float64,
+    )
+
+    confusion_weighted = np.zeros_like(confusion_unique)
+    confusion_counts = np.zeros_like(confusion_unique)
+
+    for j in range(N):
+        i = emp_idx[j]
+        k = mod_idx[j]
+
+        confusion_unique[i, k] += 1.0
+
+        if weights is not None:
+            confusion_weighted[i, k] += weights[j]
+
+        if counts is not None:
+            confusion_counts[i, k] += counts[j]
+
+    result["confusion_unique"] = confusion_unique
+
+    if weights is not None:
+        result["confusion_weighted"] = confusion_weighted
+
+    if counts is not None:
+        result["confusion_counts"] = confusion_counts
+
+    # Row-normalized confusion matrix:
+    # P(model class | empirical class)
+    row_sums = confusion_unique.sum(axis=1, keepdims=True)
+    result["confusion_unique_row_pct"] = (
+        100.0 * confusion_unique / np.maximum(row_sums, eps)
+    )
+
+    if counts is not None:
+        row_sums_c = confusion_counts.sum(axis=1, keepdims=True)
+        result["confusion_counts_row_pct"] = (
+            100.0 * confusion_counts / np.maximum(row_sums_c, eps)
+        )
+
+    return result
+#------------------------------------------------------------------------------
 def classification_metrics_from_labels(
     y_true,
     y_pred,
@@ -2536,9 +3006,85 @@ def same_length_joint_probs_from_flat(flat_data, L, use_counts=True):
         "Y_class": np.asarray(flat_data["Y_class"])[mask],
         "length": L,
     }
+#------------------------------------------------------------------------------
+# Save/Load Ensemble Model
+#-----------------------------------------------------------------------------
+def save_ensemble_model(path, ensemble_model, meta=None):
+    """Save multi-encoder ensemble"""
+    payload = {
+        'encoder_states': [enc.state_dict() for enc in ensemble_model.encoders],
+        'decoder_state': ensemble_model.decoder.state_dict(),
+        'encoder_configs': [
+            {
+                'm': enc.m,
+                'd': enc.d,
+                'learn_rho0': enc.learn_rho0,
+                'rho0_type': enc.rho0_type,
+                'eps': enc.eps,
+            }
+            for enc in ensemble_model.encoders
+        ],
+        'decoder_config': {
+            'd_in': ensemble_model.decoder.d_in,
+            'd_out': ensemble_model.decoder.d_out,
+            'use_unitary': ensemble_model.decoder.use_unitary,
+            'normalization_point': ensemble_model.decoder.normalization_point,
+            'eps': ensemble_model.decoder.eps,
+        },
+        'ensemble_config': {
+            'n_encoders': ensemble_model.n_encoders,
+            'd': ensemble_model.d,
+            'd_product': ensemble_model.d_product,
+            'normalization_point': ensemble_model.normalization_point,
+        },
+        'meta': meta or {},
+    }
+    torch.save(payload, path)
+    print(f"✓ Ensemble saved to {path}")
+
+
+def load_ensemble_model(path, device="cpu"):
+    """Load multi-encoder ensemble"""
+    payload = torch.load(path, map_location=device)
+    
+    # Reconstruct encoders
+    encoders = []
+    for enc_cfg in payload['encoder_configs']:
+        enc = KrausInstrument(
+            m=enc_cfg['m'],
+            d=enc_cfg['d'],
+            learn_rho0=enc_cfg['learn_rho0'],
+            rho0_type=enc_cfg['rho0_type'],
+            eps=enc_cfg.get('eps', 1e-8)
+        )
+        encoders.append(enc)
+    
+    # Load encoder states
+    for enc, enc_state in zip(encoders, payload['encoder_states']):
+        enc.load_state_dict(enc_state)
+    
+    # Reconstruct ensemble
+    dec_cfg = payload['decoder_config']
+    ensemble = MultiEncoderQuantumEnsemble(
+        encoders=encoders,
+        d_out=dec_cfg['d_out'],
+        use_unitary=dec_cfg['use_unitary'],
+        normalization_point=payload['ensemble_config']['normalization_point'],
+        eps=dec_cfg.get('eps', 1e-8)
+    )
+    
+    # Load decoder state
+    ensemble.decoder.load_state_dict(payload['decoder_state'])
+    ensemble = ensemble.to(device)
+    ensemble.eval()
+    
+    print(f"✓ Ensemble loaded from {path}")
+    return ensemble, payload.get('meta', {})
+
+
 # ############################################################################
 # Channel training data
-
+# ----------------------------------------------------------------------------
 def aggregate_flat_channel_data(
     flat_data,
     channel,
@@ -2769,6 +3315,18 @@ mode = 'train'
 
 prediction_loss = 'mseError'
 
+
+if os.name == 'nt':
+    print("Operating System is Windows")
+    fPath = '..\\Data Preparation\\' 
+    mPath = '..\\Models\\' 
+elif os.name == 'posix':
+    print("Operating System is Unix-based (Linux/macOS)")
+    fPath = '../data/' 
+    mPath = '../models/' 
+
+
+
 if __name__ == "__main__" and mode == 'train':
 
     # -------------------------------------------------------------------------
@@ -2780,8 +3338,9 @@ if __name__ == "__main__" and mode == 'train':
     date = dates[0]   # the data is aggregated for 1 month
     symbol= 'AAPL'
     date = dates[0]   # the data is aggregated for 1 month
-
-
+    device  = "cuda" if torch.cuda.is_available() else "cpu"
+    print('Device:',device)
+    mName = 'ENS_MD_'+ symbol+'_'+date+'_' # Ensemble Model Name
 
 
 
@@ -2840,8 +3399,10 @@ if __name__ == "__main__" and mode == 'train':
     clsNames = ['c1','c2','ca2','ca4']
     clsName    = 'c2'
     
-    fPath = '..\\Data Preparation\\' 
-    mPath = '..\\Models\\' 
+    
+
+    
+
     training_data = {}
     seq_probs_len = {}
     seq_probs_len_2 = {}
@@ -3086,7 +3647,8 @@ if __name__ == "__main__" and mode == 'train':
             print("=" * 60)
             
             d_out = 3  # prediction target dimension (e.g., 4 mid-price symbols)
-        
+            batch_size=8*512
+            
             pred_model =  train_predictive_model(
                 sequences,             # list of sequences  
                 target_distributions,  # sequence induced class distributions
@@ -3094,12 +3656,12 @@ if __name__ == "__main__" and mode == 'train':
                 global_weights,        # ← GLOBAL Empirical weights
                 encoder = encoder,
                 d_out=d_out,
-                batch_size=8*512,
+                batch_size=batch_size,
                 lr = 1e-3,
                 epochs  = 200,
                 freeze_encoder = True,
                 use_unitary = True,
-                device  = "cuda" if torch.cuda.is_available() else "cpu",
+                device  = device, #"cuda" if torch.cuda.is_available() else "cpu",
                 optimizer_name = "adam",
                 weight_decay = 1e-4,
                 encoder_lr_multiplier = 0.1,
@@ -3303,26 +3865,128 @@ if __name__ == "__main__" and mode == 'train':
         global_weights = flat_training_data["weights"]
 
         # Train ensemble (decoder only, encoders frozen)
+        
+        epochs=200
+        freeze_encoders= True,      # Keep pretrained encoders fixed
+        freeze_decoder = False,      # Train decoder
+        d_out          = 3          # decoder output: # classes  
+        batch_size = 256+128
         ensemble_trained = train_multi_encoder_ensemble(
             ensemble_model=ensemble,
             sequences_list=sequences_list,
             target_distributions=target_dists,
             global_weights=global_weights,
-            d_out=3,
-            batch_size=256+128,
+            d_out=d_out,
+            batch_size=batch_size,
             lr=1e-3,   # 5e-3, too high causing convergence problems?
-            epochs=5, #200,
-            freeze_encoders=True,      # Keep pretrained encoders fixed
-            freeze_decoder=False,      # Train decoder
-            device  = "cuda" if torch.cuda.is_available() else "cpu",
-            prediction_loss="kl",
+            epochs=epochs, #200,
+            freeze_encoders=freeze_encoders,      # Keep pretrained encoders fixed
+            freeze_decoder=freeze_decoder,      # Train decoder
+            device  = device, #"cuda" if torch.cuda.is_available() else "cpu",
+            prediction_loss="kl",      # "ce", 'js',"mse
             lambda_enc=0.0,            # Don't optimize encoder loss
             lambda_pred=1.0,
         )
+    save_ensemble = True
+    if save_ensemble:
+        # Usage
+        meta = {
+            'training_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'epochs': epochs,
+            'freeze_decoder':freeze_decoder,
+            'freeze_encoders':freeze_encoders,
+            'n_encoders': n_channels,
+            'predictors': predictors_names[:n_channels],
+            'predicted':  predicted,
+            '#classes'     : d_out,
+            'batch_size':  batch_size,
+            'symbol'    : symbol,
+        }
+        
+        save_ensemble_model(mPath+mName, ensemble_trained, meta=meta)
+        print(f"Saved ensemble model with {meta_loaded['n_encoders']} encoders")
+#-----------------------------------------------------------------------------
+    read_ensemble = False
+    if read_ensemble:
+        # Load 
+        ensemble_trained, meta = load_ensemble_model(mPath+mName, device=device)
+        print(f"Loaded ensemble model with {meta_loaded['n_encoders']} encoders")
+        
+        
+        
+    evaluate_ensemble = True
+    if evaluate_ensemble:
+        print("\n" + "=" * 70)
+        print("ENSEMBLE EVALUATION")
+        print("=" * 70)
+        
+        sequences_list = flat_training_data["X_by_channel"]
+
+        ensemble_preds = get_ensemble_predictions_ordered(
+            ensemble_model=ensemble_trained,
+            sequences_list=sequences_list,
+            batch_size=32,      # keep small for dense product rho
+            device = "cuda" if torch.cuda.is_available() else "cpu",
+            class_values=(-1, 0, 1),
+        )
+
+        ensemble_pred_dists = ensemble_preds["pred_distributions"]
+        ensemble_pred_class = ensemble_preds["pred_classes"]
+        
+        
+        ensemble_results = compute_ensemble_prediction_agreement(
+            sequences=flat_training_data["sequences"],
+            emp_target_dists=flat_training_data["Y_dist"],
+            mod_target_dists=ensemble_pred_dists,
+            class_values=flat_training_data["class_values"],
+            class_names=["Down", "Neutral", "Up"],
+            weights=flat_training_data["weights"],
+            counts=flat_training_data["counts"],
+            seq_lengths=flat_training_data["seq_lengths"],
+            )
+        
+        print("\nAgreement by Empirical Predicted Class:")
+        for class_name in ["Down", "Neutral", "Up"]:
+            pct = ensemble_results["agreement_pct_by_class"][class_name]
+            count = ensemble_results["agreements_by_class"][class_name]
+            total = ensemble_results["totals_by_class"][class_name]
+        
+            print(f"  {class_name:8s}: {pct:6.2f}% ({count}/{total})")
+
+        print("\nOccurrence-Weighted Agreement by Empirical Predicted Class:")
+        for class_name in ["Down", "Neutral", "Up"]:
+            pct = ensemble_results["count_weighted_agreement_pct_by_class"][class_name]
+            print(f"  {class_name:8s}: {pct:6.2f}%")
 
 
+        print(f"\nUnique-sequence agreement:      {ensemble_results['agreement_pct']:.2f}%")
+        
+        print(
+            f"Training-weighted agreement:   "
+            f"{ensemble_results['weighted_agreement_pct']:.2f}%"
+        )
+        
+        print(
+            f"Occurrence-weighted agreement: "
+            f"{ensemble_results['count_weighted_agreement_pct']:.2f}%"
+        )
+
+        print("This result shows how often does the model agree with the empirical dominant class,")
+        print(" weighted by how often that sequence actually occurs")
 
 sys.exit()
+
+
+
+
+
+# Step 5: Analyze encoder contributions
+contributions = ensemble_trained.get_encoder_contributions(seq_pad)
+for enc_name, contrib_data in contributions.items():
+    print(f"{enc_name}:")
+    print(f"  Mean trace: {contrib_data['mean_trace']:.6f}")
+    print(f"  Std trace: {contrib_data['std_trace']:.6f}")
+
 
 
 # -----------------------------
@@ -3387,7 +4051,10 @@ min_seq_prob = 0.000000   # threshold for rare events
 #--------------------------------------------------------------------------
 # Training Data Load
 #--------------------------------------------------------------------------
-fPath = '..\\Data Preparation\\' 
+
+
+
+
 # SEQ_DISTR_AAPL_bivariate_log_mid-micro_price_202504
 
 # sequences distributions
@@ -3476,113 +4143,7 @@ elif False:                                     # train the model
 ##############################################################################
 
 
-# Step 4: Evaluate
-print("\n" + "=" * 70)
-print("ENSEMBLE EVALUATION")
-print("=" * 70)
 
-mod_probs, mod_traces_list = ensemble_trained(seq_pad)
-
-print(f"Model predictions: {mod_probs[0]}")
-print(f"Individual encoder contributions:")
-for i, traces in enumerate(mod_traces_list):
-    print(f"  Encoder {i} trace: {float(traces[0]):.6f}")
-
-# Step 5: Analyze encoder contributions
-contributions = ensemble_trained.get_encoder_contributions(seq_pad)
-for enc_name, contrib_data in contributions.items():
-    print(f"{enc_name}:")
-    print(f"  Mean trace: {contrib_data['mean_trace']:.6f}")
-    print(f"  Std trace: {contrib_data['std_trace']:.6f}")
-
-# Step 6: Save trained ensemble
-def save_ensemble_model(path, ensemble_model, meta=None):
-    """Save multi-encoder ensemble"""
-    payload = {
-        'encoder_states': [enc.state_dict() for enc in ensemble_model.encoders],
-        'decoder_state': ensemble_model.decoder.state_dict(),
-        'encoder_configs': [
-            {
-                'm': enc.m,
-                'd': enc.d,
-                'learn_rho0': enc.learn_rho0,
-                'rho0_type': enc.rho0_type,
-                'eps': enc.eps,
-            }
-            for enc in ensemble_model.encoders
-        ],
-        'decoder_config': {
-            'd_in': ensemble_model.decoder.d_in,
-            'd_out': ensemble_model.decoder.d_out,
-            'use_unitary': ensemble_model.decoder.use_unitary,
-            'normalization_point': ensemble_model.decoder.normalization_point,
-            'eps': ensemble_model.decoder.eps,
-        },
-        'ensemble_config': {
-            'n_encoders': ensemble_model.n_encoders,
-            'd': ensemble_model.d,
-            'd_product': ensemble_model.d_product,
-            'normalization_point': ensemble_model.normalization_point,
-        },
-        'meta': meta or {},
-    }
-    torch.save(payload, path)
-    print(f"✓ Ensemble saved to {path}")
-
-
-def load_ensemble_model(path, device="cpu"):
-    """Load multi-encoder ensemble"""
-    payload = torch.load(path, map_location=device)
-    
-    # Reconstruct encoders
-    encoders = []
-    for enc_cfg in payload['encoder_configs']:
-        enc = KrausInstrument(
-            m=enc_cfg['m'],
-            d=enc_cfg['d'],
-            learn_rho0=enc_cfg['learn_rho0'],
-            rho0_type=enc_cfg['rho0_type'],
-            eps=enc_cfg.get('eps', 1e-8)
-        )
-        encoders.append(enc)
-    
-    # Load encoder states
-    for enc, enc_state in zip(encoders, payload['encoder_states']):
-        enc.load_state_dict(enc_state)
-    
-    # Reconstruct ensemble
-    dec_cfg = payload['decoder_config']
-    ensemble = MultiEncoderQuantumEnsemble(
-        encoders=encoders,
-        d_out=dec_cfg['d_out'],
-        use_unitary=dec_cfg['use_unitary'],
-        normalization_point=payload['ensemble_config']['normalization_point'],
-        eps=dec_cfg.get('eps', 1e-8)
-    )
-    
-    # Load decoder state
-    ensemble.decoder.load_state_dict(payload['decoder_state'])
-    ensemble = ensemble.to(device)
-    ensemble.eval()
-    
-    print(f"✓ Ensemble loaded from {path}")
-    return ensemble, payload.get('meta', {})
-
-
-# Usage
-meta = {
-    'training_date': '2026-04-07',
-    'epochs': 200,
-    'final_loss': 0.865,
-    'n_encoders': 3,
-    'encoder_names': ['price_ofi', 'price_ovi', 'price_volume'],
-}
-
-save_ensemble_model('ensemble_v1.pt', ensemble_trained, meta=meta)
-
-# Load later
-ensemble_loaded, meta_loaded = load_ensemble_model('ensemble_v1.pt', device=device)
-print(f"Loaded ensemble with {meta_loaded['n_encoders']} encoders")
 
 # Step 7: Inference on test/validation data
 @torch.no_grad()
