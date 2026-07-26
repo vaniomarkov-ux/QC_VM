@@ -200,11 +200,31 @@ class QuantumDecoder(nn.Module):
                            f"got '{normalization_point}'")
         
         if use_unitary:
-            self.U_re = nn.Parameter(torch.randn(d_in, d_in) * 0.01)
+            #self.U_re = nn.Parameter(torch.randn(d_in, d_in) * 0.01)
+
+            self.U_re = nn.Parameter(torch.eye(d_in, dtype=torch.float32)
+                                     + 1e-4 * torch.randn(d_in, d_in)    )
             self.U_im = nn.Parameter(torch.randn(d_in, d_in) * 0.01)
         
         self.V_re = nn.Parameter(torch.randn(d_in, d_out) * 0.01)
         self.V_im = nn.Parameter(torch.randn(d_in, d_out) * 0.01)
+    
+    def get_unitary_QR(self):
+        A = torch.complex(self.U_re, self.U_im)
+    
+        if not torch.isfinite(A.real).all() or not torch.isfinite(A.imag).all():
+            raise FloatingPointError("Non-finite entries found in decoder U.")
+    
+        Q, R = torch.linalg.qr(A, mode="reduced")
+    
+        # Phase stabilization for complex QR.
+        diag = torch.diagonal(R)
+        phase = diag / diag.abs().clamp_min(self.eps)
+    
+        Q = Q * phase.conj().unsqueeze(0)
+    
+        return Q
+    
     
     def get_unitary(self):
         if not self.use_unitary:
@@ -294,7 +314,7 @@ class QuantumDecoder(nn.Module):
         rho_batch: [B, d_in, d_in] batch of density matrices (may be unnormalized)
         returns: [B, d_out] unnormalized prediction logits
         """
-        U = self.get_unitary()          # [d_in, d_in]
+        U = self.get_unitary()         # [d_in, d_in] --or--get_unitary_EI()
         V = self.get_coisometry()       # [d_in, d_out]
         
         # === NORMALIZATION POINT: INPUT ===
@@ -555,6 +575,7 @@ def train_encoder(
     optimizer_name="adam"):
     d = 2 ** n_qubits
 
+    device = torch.device(device)
     ds = SeqDataset(sequences, emp_probs)
     dataloader = DataLoader(
         ds,
@@ -562,7 +583,8 @@ def train_encoder(
         shuffle=True,
         num_workers=0,
         collate_fn=collate_pad,
-        pin_memory=(device.startswith("cuda")),
+        #pin_memory=(device.startswith("cuda")),
+        pin_memory = device.type == "cuda",
     )
 
     if model is None:
@@ -834,33 +856,37 @@ class MultiEncoderQuantumEnsemble(nn.Module):
             normalization_point="output",  # Decoder always normalizes at output
             eps=eps
         )
-    
+
+
     def encode_sequences_multi(self, seq_pad):
-        """
-        Encode sequences with all encoders independently
-        
-        Args:
-            seq_pad: [B, T] padded sequences
-        
-        Returns:
-            rho_list: list of n density matrices, each [B, d, d]
-            traces_list: list of n trace vectors, each [B]
-        """
         rho_list = []
         traces_list = []
-        
-        for encoder in self.encoders:
-            # Each encoder processes same sequence independently
-            rho_unnorm = self._encode_with_single_encoder(encoder, seq_pad)  # [B, d, d]
-            
-            # Get traces (sequence probabilities from this encoder)
-            traces = torch.real(torch.diagonal(rho_unnorm, dim1=-2, dim2=-1).sum(-1))  # [B]
-            traces = torch.clamp(traces, min=self.eps)
-            
-            rho_list.append(rho_unnorm)
-            traces_list.append(traces)
-        
+    
+        for m, encoder in enumerate(self.encoders):
+            seq_m = seq_pad[m]  # [B, T_m], already on device
+    
+            rho_unnorm = self._encode_with_single_encoder(
+                encoder,
+                seq_m,
+            )
+    
+            tr = torch.real(
+                torch.diagonal(
+                    rho_unnorm,
+                    dim1=-2,
+                    dim2=-1,
+                ).sum(dim=-1)
+            )
+    
+            rho = rho_unnorm / tr.clamp_min(self.eps).view(-1, 1, 1)
+    
+            rho_list.append(rho)
+            traces_list.append(tr)
+    
         return rho_list, traces_list
+
+
+
     
     def _encode_with_single_encoder(self, encoder, seq_pad):
         """
@@ -953,32 +979,74 @@ class MultiEncoderQuantumEnsemble(nn.Module):
         
         return rho_product
     
-    def forward(self, seq_pad):
-        """
-        Full pipeline: multi-encode → normalize → product state → decoder
-        
-        Args:
-            seq_pad: [B, T] padded sequences
-        
-        Returns:
-            probs: [B, d_out] prediction probabilities
-            traces_list: list of [B] sequence probabilities from each encoder
-        """
-        # Step 1: Encode with all encoders independently
-        rho_list, traces_list = self.encode_sequences_multi(seq_pad)
-        
-        # Step 2: Normalize individual encoder outputs (if normalization_point="input")
-        if self.normalization_point == "input":
-            rho_list = self.normalize_encoder_outputs(rho_list, traces_list)
-        
-        # Step 3: Build product state
-        rho_product = self.build_product_state(rho_list)  # [B, d^n, d^n]
-        
-        # Step 4: Apply decoder (unitary + co-isometry)
-        probs = self.decoder.predict_probs(rho_product)  # [B, d_out]
+    def prepare_seq_pad(self, seq_pad, device=None, pad_value=-1):
+        if device is None:
+            device = next(self.parameters()).device
+    
+        n_encoders = len(self.encoders)
+    
+        if torch.is_tensor(seq_pad):
+            seq_pad = seq_pad.to(device=device, dtype=torch.long)
+    
+            if seq_pad.ndim != 3:
+                raise ValueError(
+                    f"Tensor seq_pad must have shape [B, n_encoders, T], "
+                    f"got {tuple(seq_pad.shape)}."
+                )
+    
+            return [
+                seq_pad[:, m, :]
+                for m in range(n_encoders)
+            ]
+    
+        if len(seq_pad) != n_encoders:
+            raise ValueError(
+                f"Expected {n_encoders} sequence batches, got {len(seq_pad)}."
+            )
+    
+        seq_tensors = []
+    
+        for m in range(n_encoders):
+            seq_m = seq_pad[m]
+    
+            if torch.is_tensor(seq_m):
+                seq_tensors.append(
+                    seq_m.to(device=device, dtype=torch.long)
+                )
+            else:
+                seq_m_tensors = [
+                    torch.as_tensor(s, dtype=torch.long, device=device)
+                    for s in seq_m
+                ]
+    
+                seq_m_pad = torch.nn.utils.rnn.pad_sequence(
+                    seq_m_tensors,
+                    batch_first=True,
+                    padding_value=pad_value,
+                )
+    
+                seq_tensors.append(seq_m_pad)
+    
+        return seq_tensors
 
-        
+    
+    def forward(self, seq_pad):
+        device = next(self.parameters()).device
+    
+        seq_pad = self.prepare_seq_pad(
+            seq_pad,
+            device=device,
+            pad_value=-1,
+        )
+    
+        rho_list, traces_list = self.encode_sequences_multi(seq_pad)
+    
+        rho_product = self.build_product_state(rho_list)
+    
+        probs = self.decoder.predict_probs(rho_product)
+    
         return probs, traces_list
+
     
     def get_encoder_contributions(self, seq_pad):
         """
@@ -1407,7 +1475,10 @@ def train_multi_encoder_ensemble(
     prediction_loss: str = "ce",  # "ce", "kl", "js", "mse"
     lambda_enc: float = 0.0,      # Weight for encoder loss (0 = ignore)
     lambda_pred: float = 1.0,
-):
+    checkpoint_every=None,
+    checkpoint_path_prefix=None,
+    checkpoint_meta=None,
+    ):
     """
     Train multi-encoder quantum ensemble
     
@@ -1429,7 +1500,7 @@ def train_multi_encoder_ensemble(
     Returns:
         trained ensemble_model
     """
-    
+    device = torch.device(device)
     # Verify input consistency
     n_encoders = ensemble_model.n_encoders
     assert len(sequences_list) == n_encoders, \
@@ -1446,7 +1517,7 @@ def train_multi_encoder_ensemble(
     ensemble_model.freeze_decoder(freeze_decoder)
     
     ensemble_model = ensemble_model.to(device)
-    
+
     # Create dataset
     # We need to pad sequences from all encoders
     ds = MultiEncoderDataset(sequences_list, target_distributions, global_weights)
@@ -1456,7 +1527,8 @@ def train_multi_encoder_ensemble(
         shuffle=True,
         num_workers=0,
         collate_fn=lambda batch: collate_multi_encoder(batch, n_encoders),
-        pin_memory=(device.startswith("cuda")),
+        pin_memory=(device.type == "cuda"),
+        
     )
     
     # Setup optimizer
@@ -1487,6 +1559,7 @@ def train_multi_encoder_ensemble(
     
     opt = torch.optim.Adam(param_groups, weight_decay=weight_decay)
     
+    meta_epoch = dict(checkpoint_meta or {})
     # Training loop
     for ep in range(1, epochs + 1):
         ensemble_model.train()
@@ -1495,84 +1568,112 @@ def train_multi_encoder_ensemble(
         total_loss = 0.0
         n_seen = 0
         
-        for batch_data in dataloader:
-            # Unpack batch: seq_pads for each encoder + target_dist + global_weight
-            *seq_pads, target_dist, global_weight = batch_data
+    for batch_data in dataloader:
+        *seq_pads, target_dist, global_weight = batch_data
+    
+        seq_pads = [
+            sp.to(device, non_blocking=True)
+            for sp in seq_pads
+        ]
+    
+        target_dist = target_dist.to(device, non_blocking=True)
+        global_weight = global_weight.to(device, non_blocking=True)
+    
+        batch_n = target_dist.size(0)
+    
+        global_weight_normalized = (
+            global_weight / global_weight.sum().clamp_min(1e-12)
+        )
+    
+        # Correct: pass all encoder-specific sequence batches.
+        probs, traces_list = ensemble_model(seq_pads)
+    
+        # ===== ENCODER LOSS =====
+        enc_loss = torch.tensor(0.0, device=device)
+    
+        if lambda_enc > 0:
+            for traces in traces_list:
+                p_enc = traces.clamp_min(1e-12)
+                enc_loss = enc_loss - (
+                    global_weight_normalized * torch.log(p_enc)
+                ).sum()
+    
+            enc_loss = enc_loss / len(traces_list)
+    
+        # ===== PREDICTION LOSS =====
+        eps = 1e-12
+    
+        probs = probs.clamp_min(eps)
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+    
+        target_dist = target_dist.clamp_min(eps)
+        target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True).clamp_min(eps)
+    
+        if prediction_loss == "ce":
+            pred_loss_per_sample = -(
+                target_dist * torch.log(probs)
+            ).sum(dim=-1)
+    
+        elif prediction_loss == "kl":
+            pred_loss_per_sample = (
+                target_dist * (torch.log(target_dist) - torch.log(probs))
+            ).sum(dim=-1)
+    
+        elif prediction_loss == "js":
+            m = 0.5 * (target_dist + probs)
+            m = m.clamp_min(eps)
+    
+            pred_loss_per_sample = (
+                0.5 * (
+                    target_dist * (torch.log(target_dist) - torch.log(m))
+                ).sum(dim=-1)
+                +
+                0.5 * (
+                    probs * (torch.log(probs) - torch.log(m))
+                ).sum(dim=-1)
+            )
+    
+        elif prediction_loss == "mse":
+            pred_loss_per_sample = (
+                (target_dist - probs) ** 2
+            ).sum(dim=-1)
+    
+        else:
+            raise ValueError(f"Unknown prediction_loss: {prediction_loss}")
+    
+        pred_loss = (
+            global_weight_normalized * pred_loss_per_sample
+        ).sum()
+    
+        loss = lambda_enc * enc_loss + lambda_pred * pred_loss
+    
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite loss at epoch {ep}: {loss.item()}"
+            )
+    
+        if not loss.requires_grad:
+            raise RuntimeError(
+                "Loss does not require grad. "
+                "Check freezing and accidental detach/no_grad."
+            )
+    
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+    
+        torch.nn.utils.clip_grad_norm_(
+            trainable_params,
+            1.0,
+        )
+    
+        opt.step()
+    
+        total_enc_loss += float(enc_loss.detach().cpu()) * batch_n
+        total_pred_loss += float(pred_loss.detach().cpu()) * batch_n
+        total_loss += float(loss.detach().cpu()) * batch_n
+        n_seen += batch_n
             
-            # Move to device
-            seq_pads = [sp.to(device, non_blocking=True) for sp in seq_pads]
-            target_dist = target_dist.to(device, non_blocking=True)  # [B, d_out]
-            global_weight = global_weight.to(device, non_blocking=True)  # [B]
             
-            # For multi-encoder, we need to use the SAME sequence for all encoders
-            # (assuming all encoders see same sequence, just trained on different features)
-            seq_pad = seq_pads[0]  # Use first sequence (all should be identical)
-            
-            # Forward pass
-            probs, traces_list = ensemble_model(seq_pad)  # probs: [B, d_out]
-            
-            # ===== ENCODER LOSS =====
-            enc_loss = torch.tensor(0.0, device=device)
-            
-            if lambda_enc > 0:
-                # Average encoder loss across all encoders
-                for traces in traces_list:
-                    p_enc = torch.clamp(traces, min=1e-12)
-                    global_weight_normalized = global_weight / (global_weight.sum() + 1e-12)
-                    enc_loss += -(global_weight_normalized * torch.log(p_enc)).sum()
-                
-                enc_loss = enc_loss / len(traces_list)  # Average across encoders
-            
-            # ===== PREDICTION LOSS =====
-            probs = torch.clamp(probs, min=1e-12, max=1.0)
-            target_dist = torch.clamp(target_dist, min=1e-12, max=1.0)
-            
-            global_weight_normalized = global_weight / (global_weight.sum() + 1e-12)
-            
-            if prediction_loss == "ce":
-                # Cross-entropy
-                pred_loss_per_sample = -(target_dist * torch.log(probs)).sum(dim=-1)
-                
-            elif prediction_loss == "kl":
-                # KL divergence
-                log_target = torch.log(target_dist)
-                log_probs = torch.log(probs)
-                pred_loss_per_sample = (target_dist * (log_target - log_probs)).sum(dim=-1)
-                
-            elif prediction_loss == "js":
-                # Jensen-Shannon
-                m = 0.5 * (target_dist + probs)
-                log_target = torch.log(target_dist)
-                log_probs = torch.log(probs)
-                log_m = torch.log(m)
-                pred_loss_per_sample = (
-                    0.5 * (target_dist * (log_target - log_m)).sum(dim=-1) +
-                    0.5 * (probs * (log_probs - log_m)).sum(dim=-1)
-                )
-                
-            elif prediction_loss == "mse":
-                # Mean squared error
-                pred_loss_per_sample = ((target_dist - probs) ** 2).sum(dim=-1)
-            
-            else:
-                raise ValueError(f"Unknown prediction_loss: {prediction_loss}")
-            
-            pred_loss = (global_weight_normalized * pred_loss_per_sample).sum()
-            
-            # ===== COMBINED LOSS =====
-            loss = lambda_enc * enc_loss + lambda_pred * pred_loss
-            
-            # Backward and optimize
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(ensemble_model.parameters(), 1.0)
-            opt.step()
-            
-            # Track losses
-            total_enc_loss += float(enc_loss.detach().cpu()) * seq_pad.size(0)
-            total_pred_loss += float(pred_loss.detach().cpu()) * seq_pad.size(0)
-            total_loss += float(loss.detach().cpu()) * seq_pad.size(0)
-            n_seen += seq_pad.size(0)
         
         # Epoch summary
         avg_enc_loss = total_enc_loss / max(n_seen, 1)
@@ -1586,8 +1687,37 @@ def train_multi_encoder_ensemble(
               f"Total: {avg_total_loss:.6f} | "
               f"Enc: {avg_enc_loss:.6f} | "
               f"Pred: {avg_pred_loss:.6f}")
+        
+        # ===== CHECKPOINT =====
+        if checkpoint_every is not None and checkpoint_path_prefix is not None:
+            if ep % checkpoint_every == 0:
+                ckpt_path = f"{checkpoint_path_prefix}_epoch_{ep:04d}.pt"
+        
+               
+                meta_epoch.update({
+                    "epoch": ep,
+                    "training_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "lr": lr,
+                    "batch_size": batch_size,
+                    "prediction_loss": prediction_loss,
+                    "lambda_enc": lambda_enc,
+                    "lambda_pred": lambda_pred,
+                    "freeze_encoders": freeze_encoders,
+                    "freeze_decoder": freeze_decoder,
+                    "avg_enc_loss": avg_enc_loss,
+                    "avg_pred_loss": avg_pred_loss,
+                    "avg_total_loss": avg_total_loss,
+                })
+        
+                save_ensemble_model(
+                    ckpt_path,
+                    ensemble_model,
+                    meta=meta_epoch,
+                )
+        
+                print(f"Saved checkpoint: {ckpt_path}")
     
-    return ensemble_model
+    return ensemble_model,meta_epoch
 
 
 
@@ -1626,7 +1756,7 @@ def train_predictive_model(
           lambda_enc: weight for encoder/sequence loss
           lambda_pred: weight for prediction/conditional loss
       """
-    
+    device = torch.device(device)
     d_in = encoder.d
     decoder = QuantumDecoder(d_in=d_in, d_out=d_out, use_unitary=use_unitary)
     
@@ -1641,7 +1771,7 @@ def train_predictive_model(
         shuffle=True,
         num_workers=0, 
         collate_fn=collate_bilevel,
-        pin_memory=(device.startswith("cuda")),
+        pin_memory=(device.type == "cuda"),
     )
     
    
@@ -3075,6 +3205,7 @@ def load_ensemble_model(path, device="cpu"):
     
     # Load decoder state
     ensemble.decoder.load_state_dict(payload['decoder_state'])
+    
     ensemble = ensemble.to(device)
     ensemble.eval()
     
@@ -3838,7 +3969,7 @@ if __name__ == "__main__" and mode == 'train':
 ###############################################################################
 # Quantum Ensemble of Quantum Encoders
 ###############################################################################
-    train_ensemble = True
+    train_ensemble = False
     if  train_ensemble:
         # currently encoders are in a dictionary - use the first three elements
         encoders_list =[all_encoders[channel] for channel in  range(n_channels-1) ]
@@ -3857,7 +3988,7 @@ if __name__ == "__main__" and mode == 'train':
         
         # sequences_list = [x[:3] for x in flat_training_data["sequences"]] # use the first 3 encoders
 
-        sequences_list = flat_training_data["X_by_channel"][0:3]
+        sequences_list = flat_training_data["X_by_channel"][0:3] # restricted to trhe first 3 streams
 
 
 
@@ -3867,29 +3998,12 @@ if __name__ == "__main__" and mode == 'train':
         # Train ensemble (decoder only, encoders frozen)
         
         epochs=200
-        freeze_encoders= True,      # Keep pretrained encoders fixed
-        freeze_decoder = False,      # Train decoder
+        freeze_encoders= True      # Keep pretrained encoders fixed
+        freeze_decoder = False     # Train decoder
         d_out          = 3          # decoder output: # classes  
-        batch_size = 256+128
-        ensemble_trained = train_multi_encoder_ensemble(
-            ensemble_model=ensemble,
-            sequences_list=sequences_list,
-            target_distributions=target_dists,
-            global_weights=global_weights,
-            d_out=d_out,
-            batch_size=batch_size,
-            lr=1e-3,   # 5e-3, too high causing convergence problems?
-            epochs=epochs, #200,
-            freeze_encoders=freeze_encoders,      # Keep pretrained encoders fixed
-            freeze_decoder=freeze_decoder,      # Train decoder
-            device  = device, #"cuda" if torch.cuda.is_available() else "cpu",
-            prediction_loss="kl",      # "ce", 'js',"mse
-            lambda_enc=0.0,            # Don't optimize encoder loss
-            lambda_pred=1.0,
-        )
-    save_ensemble = True
-    if save_ensemble:
-        # Usage
+        batch_size = 6*512
+        
+        
         meta = {
             'training_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'epochs': epochs,
@@ -3903,14 +4017,37 @@ if __name__ == "__main__" and mode == 'train':
             'symbol'    : symbol,
         }
         
+        
+        ensemble_trained, meta = train_multi_encoder_ensemble(
+            ensemble_model=ensemble,
+            sequences_list=sequences_list,
+            target_distributions=target_dists,
+            global_weights=global_weights,
+            d_out=d_out,
+            batch_size=batch_size,
+            lr=2e-4,   # 5e-3, too high causing convergence problems?
+            epochs=epochs, #200,
+            freeze_encoders=freeze_encoders,      # Keep pretrained encoders fixed
+            freeze_decoder=freeze_decoder,      # Train decoder
+            device  = device, #"cuda" if torch.cuda.is_available() else "cpu",
+            prediction_loss="kl",      # "ce", 'js',"mse
+            lambda_enc=0.0,            # Don't optimize encoder loss
+            lambda_pred=1.0,
+            checkpoint_every=10,
+            checkpoint_path_prefix=mPath + mName.replace(".pt", ""),
+            checkpoint_meta=meta,
+        )
+    save_ensemble = True
+    if save_ensemble:
+        meta['training_date'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")       
         save_ensemble_model(mPath+mName, ensemble_trained, meta=meta)
-        print(f"Saved ensemble model with {meta_loaded['n_encoders']} encoders")
+        print(f"Saved ensemble model  ")
 #-----------------------------------------------------------------------------
-    read_ensemble = False
+    read_ensemble = True
     if read_ensemble:
         # Load 
         ensemble_trained, meta = load_ensemble_model(mPath+mName, device=device)
-        print(f"Loaded ensemble model with {meta_loaded['n_encoders']} encoders")
+        print("Loaded ensemble model ")
         
         
         
@@ -3920,13 +4057,12 @@ if __name__ == "__main__" and mode == 'train':
         print("ENSEMBLE EVALUATION")
         print("=" * 70)
         
-        sequences_list = flat_training_data["X_by_channel"]
-
+        sequences_list = flat_training_data["X_by_channel"][0:3] 
         ensemble_preds = get_ensemble_predictions_ordered(
             ensemble_model=ensemble_trained,
             sequences_list=sequences_list,
             batch_size=32,      # keep small for dense product rho
-            device = "cuda" if torch.cuda.is_available() else "cpu",
+            device = device,
             class_values=(-1, 0, 1),
         )
 
