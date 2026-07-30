@@ -764,35 +764,7 @@ def train_transformer_process_cpu_fast(
 
 #------------------------------------------------------------------------------
 # =============================================================================
-# Save - Restore the model
-def save_transformer_process(path, model, model_config, meta=None):
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "model_config": model_config,
-            "meta": meta or {},
-        },
-        path,
-    )
 
-
-def load_transformer_process(
-    path,
-    model_class,
-    device="cpu",
-):
-    checkpoint = torch.load(
-        path,
-        map_location=device,
-        weights_only=True,
-    )
-
-    model = model_class(**checkpoint["model_config"])
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
-    model.eval()
-
-    return model, checkpoint.get("meta", {})
 # =============================================================================
 # 5) SCALING FAMILY RUNNER (for reviewer-proof baselines)
 # =============================================================================
@@ -1041,33 +1013,34 @@ if __name__ == "__main__":
         # Save model
         save_model = True
         if save_model:
-            model_config = {
-                "k": k,
-                "max_len": maxlen,
-                "delta": 1e-4,
-                "d_model": 512,
-                "n_layers": 2,
-                "n_heads": 8,
-                "d_ff": 1024,
-                "dropout": 0.1,
-            }
-            
-            save_transformer_process(
-                model_file ,
+            torch.save(
                 trained_proc,
-                model_config,
-                meta={"epochs": 500},
-            )
+                model_file,
+                )
+            
+            
         
             restore_model = False
             if restore_model:
-                trained_proc, meta = load_transformer_process(
-                    "causal_transformer_process.pt",
-                    CausalTransformerNextSymbol,
-                    device="cpu",
+                device = torch.device("cpu")  # or "cuda"
+                
+                trained_proc = torch.load(
+                    model_file,
+                    map_location=device,
+                    weights_only=False,
                 )
                 
+                trained_proc.model.to(device)
+                trained_proc.device = device
+                #trained_proc.model.eval()
+                '''                
+                Z = trained_proc.embed_prefixes(
+                    prefixes=sequences,
+                    layer=-1,
+                )
                 
+                print(Z.shape)
+                '''
         #-----------------------------------------------------------------------------
         # Calculate the spectrum of representation
         #-----------------------------------------------------------------------------
