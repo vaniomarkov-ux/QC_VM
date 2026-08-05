@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import random
 
+from tqdm.auto import tqdm
 
 from sklearn.metrics import (
     accuracy_score,
@@ -627,7 +628,6 @@ def train_validate_svm(
     svm = SVC(
         class_weight=class_weight,
         decision_function_shape="ovr",
-        probability=False,
         random_state=seed,
         cache_size=cache_size_mb,
     )
@@ -696,9 +696,8 @@ def train_validate_svm(
         pre_dispatch=n_jobs,
         return_train_score=True,
         error_score="raise",
-        verbose=0,
+        verbose=2,
     )
-
 
     sample_weights = make_training_sample_weights(
         train_target_probabilities,
@@ -921,36 +920,65 @@ def count_params(model: nn.Module) -> int:
 #------------------------------------------------------------------------------
 #   Transformer representation extractor
 #------------------------------------------------------------------------------
+
+
+
 def make_prefix_embedding_extractor(
     model,
-    *,
     layer: int = -1,
     batch_size: int = 512,
-) -> FeatureExtractor:
+    show_progress: bool = True,
+):
     """
-    Works for the causal transformer and for any RNN exposing:
+    Create an extractor returning one transformer embedding per sequence.
 
-        model.embed_prefixes(prefixes, layer=...)
+    Output shape:
+        (number_of_sequences, embedding_dimension)
     """
 
-    def extract(
-        sequences: Sequence[Sequence[int]],
-    ) -> np.ndarray:
-        model.model.eval()
+    def extract(sequences):
+        sequences = list(sequences)
 
-        batches: list[np.ndarray] = []
+        if len(sequences) == 0:
+            raise ValueError("The sequence collection is empty.")
+
+        if hasattr(model, "model"):
+            model.model.eval()
+        elif hasattr(model, "eval"):
+            model.eval()
+
+        batches = []
+
+        batch_starts = range(
+            0,
+            len(sequences),
+            batch_size,
+        )
+
+        total_batches = (
+            len(sequences) + batch_size - 1
+        ) // batch_size
+
+        iterator = tqdm(
+            batch_starts,
+            total=total_batches,
+            desc="Transformer embeddings",
+            unit="batch",
+            disable=not show_progress,
+        )
+
+        start_time = time.perf_counter()
 
         with torch.inference_mode():
-            for start in range(
-                0,
-                len(sequences),
-                batch_size,
-            ):
+            for start in iterator:
+                stop = min(
+                    start + batch_size,
+                    len(sequences),
+                )
+
                 batch_sequences = [
                     list(sequence)
-                    for sequence in sequences[
-                        start:start + batch_size
-                    ]
+                    for sequence in sequences[start:stop]
                 ]
 
                 Z = model.embed_prefixes(
@@ -958,24 +986,47 @@ def make_prefix_embedding_extractor(
                     layer=layer,
                 )
 
-                if isinstance(Z, torch.Tensor):
-                    Z = (
-                        Z.detach()
-                        .cpu()
-                        .numpy()
+                if torch.is_tensor(Z):
+                    Z = Z.detach().cpu().numpy()
+
+                Z = np.asarray(Z)
+
+                if Z.ndim != 2:
+                    raise ValueError(
+                        "embed_prefixes must return a matrix "
+                        f"with shape (batch, dimension); received {Z.shape}."
                     )
 
-                batches.append(
-                    np.asarray(Z)
+                batches.append(Z)
+
+                elapsed = time.perf_counter() - start_time
+                completed = stop
+
+                rate = completed / max(elapsed, 1e-12)
+
+                iterator.set_postfix(
+                    sequences=f"{completed}/{len(sequences)}",
+                    rate=f"{rate:.1f}/s",
                 )
 
-        return np.concatenate(
+        X = np.concatenate(
             batches,
             axis=0,
         )
 
-    return extract
+        elapsed = time.perf_counter() - start_time
 
+        print(
+            "\nTransformer extraction completed:"
+            f"\n  sequences = {len(sequences)}"
+            f"\n  dimension = {X.shape[1]}"
+            f"\n  time      = {elapsed:.2f} seconds",
+            flush=True,
+        )
+
+        return X
+
+    return extract
 #------------------------------------------------------------------------------
 #   RNN representation extractor
 #------------------------------------------------------------------------------
@@ -1130,56 +1181,94 @@ def make_pi_extractor(
 # Rpresentation - SVM training
 #------------------------------------------------------------------------------
 def run_representation_svm(
-    representation_name: str,
-    extractor: FeatureExtractor,
+    representation_name,
+    extractor,
     train_dset,
     valid_dset,
     *,
-    n_classes: int = 3,
-    kernels: Sequence[str] = ("linear",),
-    standardize: bool = True,
-    class_weight: str | dict | None = "balanced",
-    sample_weight_mode: str | None = None,
-    seed: int = 1234,
-    cv_splits: int = 5,
-    svm_n_jobs: int = -1,
-) -> dict[str, Any]:
-    """
-    Extract one representation and evaluate its SVM readout.
-    """
+    n_classes=3,
+    kernels=("linear", "rbf"),
+    standardize=True,
+    class_weight="balanced",
+    sample_weight_mode=None,
+    seed=1234,
+    cv_splits=5,
+    svm_n_jobs=1,
+    **svm_kwargs,
+):
+    import time
+
     set_reproducible_seed(seed)
 
-    (
-        train_sequences,
-        P_train,
-        y_train,
-    ) = parse_probability_dataset(
-        train_dset,
-        n_classes=n_classes,
+    print(
+        f"\n{'=' * 72}"
+        f"\nRepresentation: {representation_name}"
+        f"\n{'=' * 72}",
+        flush=True,
     )
 
-    (
-        valid_sequences,
-        P_valid,
-        y_valid,
-    ) = parse_probability_dataset(
-        valid_dset,
-        n_classes=n_classes,
+    print("\n[1/4] Parsing datasets", flush=True)
+
+    train_sequences, P_train, y_train = (
+        parse_probability_dataset(
+            train_dset,
+            n_classes=n_classes,
+        )
     )
 
-    extraction_start = time.perf_counter()
+    valid_sequences, P_valid, y_valid = (
+        parse_probability_dataset(
+            valid_dset,
+            n_classes=n_classes,
+        )
+    )
+
+    print(
+        f"  training examples   = {len(train_sequences)}"
+        f"\n  validation examples = {len(valid_sequences)}",
+        flush=True,
+    )
+
+    print(
+        "\n[2/4] Extracting training representations",
+        flush=True,
+    )
+
+    start = time.perf_counter()
 
     X_train_raw = extractor(
         train_sequences
     )
 
+    train_extraction_seconds = (
+        time.perf_counter() - start
+    )
+
+    print(
+        f"Training extraction finished in "
+        f"{train_extraction_seconds:.2f} seconds.",
+        flush=True,
+    )
+
+    print(
+        "\n[3/4] Extracting validation representations",
+        flush=True,
+    )
+
+    start = time.perf_counter()
+
     X_valid_raw = extractor(
         valid_sequences
     )
 
-    extraction_seconds = (
-        time.perf_counter()
-        - extraction_start
+    valid_extraction_seconds = (
+        time.perf_counter() - start
+    )
+
+    print(
+        f"Validation extraction finished in "
+        f"{valid_extraction_seconds:.2f} seconds.",
+        flush=True,
     )
 
     X_train = to_real_feature_matrix(
@@ -1190,21 +1279,19 @@ def run_representation_svm(
         X_valid_raw
     )
 
-    if X_train.shape[0] != len(
-        train_sequences
-    ):
-        raise ValueError(
-            "Training representation row count does not "
-            "match train_dset."
-        )
+    print(
+        "\nRepresentation matrices:"
+        f"\n  X_train = {X_train.shape}"
+        f"\n  X_valid = {X_valid.shape}",
+        flush=True,
+    )
 
-    if X_valid.shape[0] != len(
-        valid_sequences
-    ):
-        raise ValueError(
-            "Validation representation row count does not "
-            "match valid_dset."
-        )
+    print(
+        "\n[4/4] Starting SVM cross-validation",
+        flush=True,
+    )
+
+    start = time.perf_counter()
 
     result = train_validate_svm(
         X_train=X_train,
@@ -1216,37 +1303,35 @@ def run_representation_svm(
         kernels=kernels,
         standardize=standardize,
         class_weight=class_weight,
-        sample_weight_mode=(
-            sample_weight_mode
-        ),
-        cv_splits=cv_splits,
+        sample_weight_mode=sample_weight_mode,
         seed=seed,
+        cv_splits=cv_splits,
         n_jobs=svm_n_jobs,
+        **svm_kwargs,
+    )
+
+    svm_seconds = time.perf_counter() - start
+
+    print(
+        f"\nSVM training completed in "
+        f"{svm_seconds / 60.0:.2f} minutes.",
+        flush=True,
     )
 
     result.update({
-        "representation_name": (
-            representation_name
-        ),
+        "representation_name": representation_name,
+        "n_features": int(X_train.shape[1]),
         "feature_extraction_seconds": (
-            extraction_seconds
+            train_extraction_seconds
+            + valid_extraction_seconds
         ),
-        "train_class_counts": dict(
-            zip(
-                *np.unique(
-                    y_train,
-                    return_counts=True,
-                )
-            )
+        "train_extraction_seconds": (
+            train_extraction_seconds
         ),
-        "valid_class_counts": dict(
-            zip(
-                *np.unique(
-                    y_valid,
-                    return_counts=True,
-                )
-            )
+        "valid_extraction_seconds": (
+            valid_extraction_seconds
         ),
+        "svm_seconds": svm_seconds,
     })
 
     return result
@@ -1542,6 +1627,7 @@ transformer_extractor = (
         trm_model,
         layer=-1,
         batch_size=512,
+        show_progress=True,
     )
 )
 
@@ -1552,17 +1638,15 @@ transformer_result = run_representation_svm(
     extractor=transformer_extractor,
     train_dset=training ,
     valid_dset=validation,
+    n_classes=3,
     kernels=("linear", "rbf"),
     standardize=True,
     class_weight="balanced",
     sample_weight_mode=None,
     seed=1234,
     cv_splits=5,
-    svm_n_jobs=14,  # -1
+    svm_n_jobs=-1,  # -1
 )
-
-
-
 
 
 print_representation_svm_report(
