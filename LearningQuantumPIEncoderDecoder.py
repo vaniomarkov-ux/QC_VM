@@ -2668,10 +2668,6 @@ n_symbols = 4   #observable symbols per feature
 frequency = 100 #events
 freq_units = 'evn'
 
-max_seq_len =  6          # max sequence length to be used for training 
-min_seq_prob = 0.000000   # threshold for rare events
-
-
 # Load empirical sequence data
 # sequences_all, emp_probs_all = load_your_empirical_data()
 # Filter by length and probability
@@ -2724,7 +2720,7 @@ print("Loaded Class Distribution:", title)
 sequences = []
 emp_probs = []
 emp_dstrb = []
-min_seq_prob=0.00001
+min_seq_prob=0.0001
 max_seq_len = 5
 
 for i in range(len(sequences_all)):
@@ -2800,6 +2796,16 @@ print("Training ","Freeze Encoder", freeze_encoder, "Weight encoder ", lambda_en
 
 train_prediction_model = True
 
+device: str = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+gpu_id = 3
+device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu" 
+
+
 if train_prediction_model:
     pred_model = train_predictive_model_pi(
         sequences = training_sequences,
@@ -2846,7 +2852,7 @@ if train_prediction_model:
     save_predictive_model(save_model_file, pred_model, meta)
     print("Predictive Model saved as", save_model_file)
 else:                         #Load prediction model
-    pred_model, meta = load_predictive_model(save_model_file, device='cpu')
+    pred_model, meta = load_predictive_model(save_model_file, device=device)
     
     print("Predictive Model loaded from", save_model_file)
     # print(f"Loaded model trained for {meta_loaded['epochs_trained']} epochs")
@@ -2873,10 +2879,10 @@ plot_divergence_by_length(sequences, target_distributions, mod_target_distributi
 )
            
 
-   # Performance Evaluation
-   
-   #-----------------------------------------------------------------------------
-   # Model Output - generative probabilities and class distributions for 
+# Performance Evaluation
+
+#-----------------------------------------------------------------------------
+# Model Output - generative probabilities and class distributions for 
    
 report( sequences, target_distributions, mod_target_distributions )
    
@@ -2886,7 +2892,9 @@ report( sequences, target_distributions, mod_target_distributions )
 # Read out of sample data ------------------------------------------------
 #-------------------------------------------------------------------------------
 # Read out of sample data ------------------------------------------------
+print('========================================================================')
 print('Out of sampe test: Training date', date,' Validation date', date_validation)
+print('========================================================================')
 
 #-----------------------------------------------------------------------------
 # Load sequences distributions -out of samples
@@ -2910,7 +2918,9 @@ print('Loaded Validation Class Disributions ', title)
 emp_cls_dstrbs = target_distributions
 
 
-
+print('-----------------------------------------------------------------------')
+print('Validation for  max sequence length ',  max_seq_len)
+print('-----------------------------------------------------------------------')
 sequences = []
 emp_probs = []
 emp_dstrb = []
@@ -2921,6 +2931,39 @@ emp_probs_all = distrs_samples[1]
 
 for i in range(len(sequences_all)):
     if len(sequences_all[i]) <= max_seq_len and emp_probs_all[i] > min_seq_prob:
+        sequences.append(list(sequences_all[i]))
+        emp_probs.append(emp_probs_all[i])
+        emp_dstrb.append(emp_cls_dstrbs[i][1]) 
+        
+        assert emp_cls_dstrbs[i][0]==sequences_all[i]
+
+       
+global_weights = compute_global_weights(sequences, emp_probs)   
+
+
+
+
+# Apply model out of sample      
+mod_seq_probs, mod_target_distributions = get_model_predictions_ordered(pred_model, sequences)
+        
+print("Out of Sample Report for ", date)
+report( sequences, emp_dstrb, mod_target_distributions )    
+
+
+print('---------------------------------------------------------------------')
+print('-----------------------------------------------------------------------')
+print('Validation for  max sequence length ',  max_seq_len-1)
+print('-----------------------------------------------------------------------')
+sequences = []
+emp_probs = []
+emp_dstrb = []
+
+sequences_all = distrs_samples[0]
+emp_probs_all = distrs_samples[1]
+
+
+for i in range(len(sequences_all)):
+    if len(sequences_all[i]) <= max_seq_len-1 and emp_probs_all[i] > min_seq_prob:
         sequences.append(list(sequences_all[i]))
         emp_probs.append(emp_probs_all[i])
         emp_dstrb.append(emp_cls_dstrbs[i][1]) 
