@@ -2458,359 +2458,273 @@ for clsName in clsNames:
  
       
         # -------------------------------------------------------------------------
-        # particular learning task parameters
-        dates = ['202504','20250303','20250304']  # training and validation
-        symbol= 'AAPL'
-        
-        
-        variate="bivariate"
-        
-        n_symbols = 4   #observable symbols per feature
-    
-        # resampling 
-        frequency = 100 #events
-        freq_units = 'evn'
-        
-        max_seq_len =  6          # max sequence length to be used for training 
-        min_seq_prob = 0.000000   # threshold for rare events
-    
-        
-        # Load empirical sequence data
-        # sequences_all, emp_probs_all = load_your_empirical_data()
-        # Filter by length and probability
-        
-        #------------------------------------------------------------------
-        # Pre-trained models location
-        mPath = '..\\models\\'
-        #--------------------------------------------------------------------------
-        # Training Data Load
-        #--------------------------------------------------------------------------
-        fPath = '..\\data\\' 
-        # SEQ_DISTR_AAPL_bivariate_log_mid-micro_price_202504
-    
-        
-        monthly_data = False
-        if monthly_data:
-            n_qubits = 3  # system dimension d = 2^n_qubits 
-            d = 2 ** n_qubits 
-            
-            date = dates[0]   # the data is aggregated for 1 month
-            # sequences distributions
-            title = "SEQ_DISTR_"+symbol+"_"+variate+"_"+predicted+"-"+predictor+"_"+date
-            
-            #---------------------------------------------------------------
-            #   TEMP _Remove
-            #--------------------------------------------------------------
-            # title = "SQ_PRB_AAPL_20250303_log_mid_sigma_W"
-       
-            #--------------------------------------------------------------
-             
-            infname = fPath+title
-            distrs_samples =  pickle.load(open( infname, "rb") ) 
-            sequences_all = distrs_samples[1]
-            emp_probs_all = [i[1] for i in distrs_samples[0]] # empirical proabilities
-          
-            sequences = []
-            emp_probs = []
-            for i in range(len(sequences_all)):
-                if len(sequences_all[i]) <= max_seq_len and emp_probs_all[i] > min_seq_prob:
-                    sequences.append(sequences_all[i])
-                    emp_probs.append(emp_probs_all[i])
-          
-        else:
-            n_qubits = 5  # system dimension d = 2^n_qubits 
-            d = 2 ** n_qubits 
-            
-            date = dates[1]
-            title = "SQ_PRB_"+symbol+"_"+date+"_"+predicted+"_"+predictor
-            infname = fPath+title
-            distrs_samples =  pickle.load(open( infname, "rb") ) 
-            sequences = [list(s) for s in distrs_samples[0]]
-            emp_probs = distrs_samples[1]
-            
-        global_weights = compute_global_weights(sequences, emp_probs)   
-      
-        print(f"Number of training sequences: {len(sequences)}")
-        print('Loaded from ',title )
-        
-        # Train encoder (generative channel)
-        # -----------------------------------------------------------------
-        # -----------------------------------------------------------------
-        # Location and name of trained encoder
-        #------------------------------------------------------------------
-        
-        if monthly_data:
-            save_file_name = 'MOD'+title[9:] +'_'+str(n_qubits)+'q'
-            model_file_name = "WGHTS_"+save_file_name[4:]+'.pt'
-             
+# particular learning task parameters
+dates = ['202503','20250303','20250304', '20250401', '20250402' ]  # training and validation
 
-            print("Loading pre-trained encoder:",save_file_name)
-            print("Loading pre-trained encoder:",model_file_name )
-            # [model, sequences, emp_probs ]
-            result = pickle.load( open( mPath + save_file_name, "rb") )
-            #model, sequences, emp_probs = result[0], result[1], result[2]
-            encoder, meta=load_model_weights(mPath + model_file_name, m, n_qubits, learn_rho0=True, device="cpu")
-            # model test
-            mod_seq_probs = predict_probs(encoder, sequences)
-            
-            total_loss = 0
-            for i in range(len(mod_seq_probs)):
-                total_loss = total_loss+emp_probs[i]*(emp_probs[i]-mod_seq_probs[i])**2
-    
-    
-            #Kseq, rho0, p = model.path_operator(sequences_all[-1], return_prob=True, device="cpu")
-    
-            plotDistributions(emp_probs[:200],mod_seq_probs[:200], sequences[:200],
-                              title+' C='+f"{total_loss:.4e}", 'Target', 'Model', c1 = 'blue', c2='red' )
+symbol= 'AAPL'
+symbol= 'INTC'
+symbol= 'NVDA'
 
-        else:
-            mFname = 'QMOD_'+symbol+'_'+date+'_'+predicted+"_"+predictor+'_'+str(n_qubits)+'q'
-            encoder =  pickle.load( open( mPath + mFname, "rb") )[0]  #  [model, sequences, emp_probs ]         
-            
-            
-        #--------------------------------------------------------------------------
-        # Local encoder pre-training - SKIP 
-        #--------------------------------------------------------------------------
-        ##########################################################################
-        
-        learn_rho0 = True
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        rho0_type = "mixed"  # or  "pure"
+features     = ['log_mid',"tvi_n" , 'obi_L1', "ofi_L1_n", "ofi_L1_n_norm",'ofi_L1_norm_n','ofi_L3_norm_n','ofi_L10_norm_n',"micro_price",'vpin', 'sigma_W' ]
+features     = ['log_mid', "ofi_L1_n_norm",'ofi_L1_norm_n','ofi_L3_norm_n','ofi_L10_norm_n',"micro_price",'vpin', 'sigma_W' ]
+features     = ['log_mid', 'sigma_W' ]
+predicted  =  features[0]  # 'log_mid'
+predictor  =  features[1]
+
+seq_lengths = [1,2,3,4,5]
+
+
+
+n_qubits = 5  # system dimension d = 2^n_qubits 
+d = 2 ** n_qubits 
     
-        # Initialize clean encoder
-        encoder = KrausInstrument(
-            m=m, 
-            d=d, 
-            learn_rho0=learn_rho0,
-            rho0_type=rho0_type
-        ).to(device)
+
+prediction_loss="mseError"
+prediction_loss="xEntropy"
+prediction_loss="klDivergence"
+prediction_loss="jsDivergence"
+prediction_loss = 'mseError'
+
+monthly_data = True
+if monthly_data:
+    date = dates[0]   # the data is aggregated for 1 month
+else:
+    date = dates[1]    
+
+date_validation = dates[-2]
+
+#------------------------------------------------------------------
+# Pre-trained models location
+mPath = '.\\models\\'
+#--------------------------------------------------------------------------
+# Training Data Load
+#--------------------------------------------------------------------------
+fPath = '.\\data\\' 
+# SEQ_DISTR_AAPL_bivariate_log_mid-micro_price_202504
+
+
+
+# -----------------------------
+# Step 1: Pretrain encoder on sequence distributions
+# -----------------------------
+print('Class', clsName, "Predictor", predictor)
+print("=" * 60)
+print("STEP 1: Pretraining encoder on sequences")
+print("=" * 60)
+
+title_model = "PRD_OMEGA_" +clsName+"_"+symbol+"_"+predicted+"-"+predictor+"_"+date+'_'+prediction_loss+'_'+str(n_qubits)+'q'
+save_model_file = mPath+title_model
+
+# Configuration
+m = 16  # alphabet size (e.g., 4x4 for price+OFI encoding)
+##########################################################################
+# Encoder System Size
+##########################################################################
+# -------------------------------------------------------------------------
+
+variate="bivariate"
+
+n_symbols = 4   #observable symbols per feature
+
+# resampling 
+frequency = 100 #events
+freq_units = 'evn'
+
+
+
+
+
+# Load empirical sequence data
+# sequences_all, emp_probs_all = load_your_empirical_data()
+# Filter by length and probability
+
+
+
+if monthly_data:
+    # sequences distributions
+    #       "SEQ_DISTR_  AAPL    _  bivariate_log_mid-sigma_W_202503"           
+    title = "SEQ_DISTR_"+symbol+"_"+variate+"_"+predicted+"-"+predictor+"_"+date
     
-        # Verify initialization
-        print(f"Clean Encoder initialized:")
-        print(f"  Alphabet size (m): {encoder.m}")
-        print(f"  System dimension (d): {encoder.d}")
-        print(f"  Initial state type: {encoder.rho0_type}")
-        print(f"  Learn ρ₀: {encoder.learn_rho0}")
+    #---------------------------------------------------------------
+    #   TEMP _Remove
+    #--------------------------------------------------------------
+    # title = "SQ_PRB_AAPL_20250303_log_mid_sigma_W"
+    title = "SQ_PRB_NVDA_bivariate_log_mid-sigma_W_202503"
+    #--------------------------------------------------------------
+     
+    infname = fPath+title
+    distrs_samples =  pickle.load(open( infname, "rb") ) 
+    sequences_all = distrs_samples[1]
+    emp_probs_all = [i[1] for i in distrs_samples[0]] # empirical proabilities
+    print('Loaded Sequence Disributions ', title) 
+
   
-        
-    # -----------------------------
-    # Step 2: Prepare predictive dataset
-    # -----------------------------
-    print("\n" + "=" * 60)
-    print("STEP 2: Preparing predictive dataset")
-    print("=" * 60)
-    
-    
-    
-    # Load sequences with target labels
-    # Each sequence is a prefix, target is the next symbol to predict
-    # pred_sequences, pred_targets, pred_emp_probs = load_predictive_data()
-    
-    # Example: synthetic data for illustration
-    # pred_sequences = [[0,1,2], [1,2,3], [2,3,4], ...]
-    # pred_targets = [3, 4, 5, ...]  # next mid-price symbol
-    # pred_emp_probs = [0.01, 0.015, 0.008, ...]
-    
-
-    # include class type in the class distibutions file name
-    ###########################################################################
-    # Training can be done using individual or joint training data
-    ###########################################################################
-    joint_training = False  # no multiple models to be in sync
-    if not joint_training:
-        # Individual training data sets
-        print('Training individual encode/decoder from individua data', symbol, date, "Predicted", predicted, "Predictor=", predictor, "Class=",clsName)
-
-        if monthly_data:
-            title = "CLS_DISTR_"+symbol+"_"+"_"+predicted+"-"+predictor+"_"+date+"_"+clsName
-            infname = fPath+title
-            
-            class_distributions =  pickle.load(open( infname, "rb") ) 
-            
-            print("Loaded:", title) 
-            sequences, target_distributions, seq_probs = integrate_data(class_distributions, distrs_samples)
-            
-            # calculate empirical weight of a sequence 
-            global_weights = compute_global_weights(sequences, emp_probs)
-    
-            print(f"Number of unique sequences: {len(sequences)}")
-        else:
-            title = "CLS_DISTR_"+symbol+"_"+date+'_'+predicted+"_"+predictor+"_"+clsName
-            infname = fPath+title
-           
-            target_distributions =  pickle.load(open( infname, "rb") )
-            
-            target_distributions = [d[1] for d in target_distributions]
-            
-            seq_probs = emp_probs
-            print("Loaded:", title) 
-            
-    else:                # Joint Training data sets
-        sequences            = []
-        target_distributions = []
-        seq_probs            = []         
-        for seq_length in seq_lengths:
-            fName = "ENS_TD_"+symbol+"_"+date+"_SL_"+str(seq_length)+"_CL_c1_log_mid_tvi_n-obi_L1-ofi_L1_n_norm"
-            # fPath = '..\\Data Preparation\\' 
-            data  = pickle.load( open( fPath+fName, "rb") )
-
-            joint_data, component_data = data[0], data[1]
-            training_data = extract_ensemble_arrays(joint_data, component_data)
-
-            channel = features.index(predictor)-1
-            channel_data = get_channel_tdata(training_data, channel)
-
-            sequencesL            = channel_data["X"].tolist()
-            target_distributionsL = channel_data["target_distributions"].tolist()
-            counts                = channel_data["counts"].tolist()
-            seq_probsL            = channel_data["seq_probs"].tolist()
-            
-            sequences = sequences + sequencesL
-            target_distributions = target_distributions+target_distributionsL
-            seq_probs = seq_probs + seq_probsL
-            
-
-        # calculate empirical weight of a sequence 
-        global_weights = compute_global_weights(sequences, seq_probs)
- 
-   
-    # -----------------------------
-    # Step 3: Train full predictive model
-    # -----------------------------
-    #prediction_loss in 'xEntropy', 'klDivergence', 'jsDivergence', 'mseError'"
-    prediction_loss = 'mseError'
-    print("\n" + "=" * 60)
-    print("STEP 3: Training predictive model (encoder + decoder)",  predictor, predicted,"Loss=", prediction_loss, 'Class-=', clsName)
-    print("Sequences Lengths", seq_lengths)
-    print("=" * 60)
-    
-    d_out = 3  # prediction target dimension (e.g., 4 mid-price symbols)
-
-#   #--------------------------------------------------------------------------
-    # Joint Training Encoder-Decoder
-    #--------------------------------------------------------------------------
-    freeze_encoder = False                         #  train/no-train the encoder
-    if freeze_encoder:
-        lambda_enc = 0.0                          #  weight for encoder loss
-        lambda_pred  = 1                          #  weight for prediction loss
-    else:
-        lambda_enc = 0.02                          #  weight for encoder loss - 0.02
-        lambda_pred  = 0.98                        #  weight for prediction loss
-
-    batch_size = 8*512
-    epochs  = 100
-    print("Training ","Freeze Encoder", freeze_encoder, "Weight encoder ", lambda_enc, "Weight Prediction",lambda_pred )
-    
-    
-    pred_model =  train_predictive_model_bilevel(
-        sequences,             # list of sequences  
-        target_distributions,  # sequence induced class distributions
-        seq_probs,             # sequence probabilities wrt same length distributions
-        global_weights,        # ← GLOBAL Empirical weights
-        encoder = encoder,
-        d_out=d_out,
-        batch_size=batch_size,
-        lr = 1e-3,
-        epochs  = epochs,
-        #freeze_encoder = True,
-        freeze_encoder = freeze_encoder,
-        use_unitary = True,
-        device  = "cuda" if torch.cuda.is_available() else "cpu",
-        optimizer_name = "adam",
-        weight_decay = 1e-4,
-        encoder_lr_multiplier = 0.1,
-        lambda_enc = lambda_enc  ,   
-        lambda_pred  = lambda_pred,  
-        prediction_loss = prediction_loss,
-        num_workers = 0,
-    )
-
-    # Save metadata
-    
-    meta = {
-        'batch_size': batch_size,
-        'epochs_trained': epochs,
-        'lambda_enc': lambda_enc ,
-        'lambda_pred':lambda_pred,
-        'date'       :date, 
-        'prediction_loss':prediction_loss,
-        }
-    
-    
-    #title = "PRD_" +str(class_type)+"_"+symbol+"_"+predicted+"-"+predictor+"_"+date+'_'+prediction_loss+'_'+str(n_qubits)+'q'
-    title = "PRD_" +clsName+"_"+symbol+"_"+predicted+"-"+predictor+"_"+date+'_'+prediction_loss+'_'+str(n_qubits)+'q'
-    save_file = mPath+title
-    save_predictive_model(save_file, pred_model)
-    print("Predictive Model saved as", save_file)
-    
-    # Load
-    # pred_model_loaded, meta_loaded = load_predictive_model('pred_model_v1.pt', device='cuda')
-    
-    # print(f"Loaded model trained for {meta_loaded['epochs_trained']} epochs")
-    # print(f"Final training loss: {meta_loaded['final_loss']}")
-    
-    # Use for inference
-    # result = predict_from_sequence(pred_model_loaded, [0, 1, 2])
-
-    
-    #-----------------------------------------------------------------------------
-    # Model Output - generative probabilities and class distributions for 
-    
-    # apply model for set of sequences
-    mod_seq_probs, mod_target_distributions = get_model_predictions_ordered(pred_model, sequences)
-    
-    
-    # quality of the generative model / the encoder
-    plot_generative_distributions = False
-    if plot_generative_distributions:
-        total_loss = 0
-        for i in range(len(mod_seq_probs)):
-            total_loss = total_loss+seq_probs[i]*(seq_probs[i]-mod_seq_probs[i])**2
-        
-        plotDistributions(seq_probs[:200],mod_seq_probs[:200], sequences[:200],
-                      "Encoder:"+title+' C='+f"{total_loss:.3e}", 'Trgt', 'Mdl', c1 = 'blue', c2='red' )
-    
-    # quality of the predictive model / the decoder
-    
-    #divergences_by_length = compute_divergences_by_length(sequences,  target_distributions,  mod_target_distributions, divergence_type = "kl")
-    plot_divergence_by_length(sequences, target_distributions, mod_target_distributions,  mod_seq_probs=None, emp_seq_probs=None,
-        divergence_type = prediction_loss, figsize=(14, 6),
-        title="Performance: "+prediction_loss+" by Seq Length"
-    )
-    
-    benchmark_loss = prediction_loss
-    plot_divergence_by_length(sequences, target_distributions, mod_target_distributions,  
-                              mod_seq_probs=None, emp_seq_probs=None,
-                              divergence_type = benchmark_loss, figsize=(14, 6),
-        title="Performance: "+benchmark_loss+" by Seq Length"
-    )
-           
-    plt.show()
-    
-    # Performance Evaluation
-    
-    #-----------------------------------------------------------------------------
-    # Model Output - generative probabilities and class distributions for 
-    
-    report( sequences, target_distributions, mod_target_distributions )
-    
-    # ---------------------------------------------------------------------        
-    # Done with in-sample estimated
-    
-    # Read out of sample data ------------------------------------------------
-    print('Out of sampe test date-in', dates[1],' date-out', dates[2])
-
-    date = dates[2]
+else:  # daily data
     title = "SQ_PRB_"+symbol+"_"+date+"_"+predicted+"_"+predictor
     infname = fPath+title
     distrs_samples =  pickle.load(open( infname, "rb") ) 
     sequences = [list(s) for s in distrs_samples[0]]
     emp_probs = distrs_samples[1]
-            
-    global_weights = compute_global_weights(sequences, emp_probs)   
-    print('Loaded ', title)
     
-    #Read out of sample class data
+
+#-----------------------------------------------------------------------------
+# Loading Class Distributions - Training
+#-----------------------------------------------------------------------------
+if monthly_data:     # CLS_DISTR_AAPL__log_mid-sigma_W_202503_ca4
+    title = "CLS_DISTR_"+symbol+"_"+"_"+predicted+"-"+predictor+"_"+date+"_"+clsName
+    title = "CLS_DISTR_"+symbol+"_"+predicted+"-"+predictor+"_"+date+"_"+clsName
+    infname = fPath+title
+ 
+    #print(f"Number of unique sequences: {len(sequences)}")
+else:       # CLS_DISTR_AAPL_20250303_log_mid_sigma_W_ca4
+    title = "CLS_DISTR_"+symbol+"__"+date+'_'+predicted+"_"+predictor+"_"+clsName
+    infname = fPath+title
+   
+emp_cls_dstrbs =  pickle.load(open( infname, "rb") )
+print("Loaded Class Distribution:", title) 
+
+
+sequences = []
+emp_probs = []
+emp_dstrb = []
+min_seq_prob=0.0001
+max_seq_len = 5
+
+for i in range(len(sequences_all)):
+    if len(sequences_all[i]) <= max_seq_len and emp_probs_all[i] > min_seq_prob:
+        sequences.append(sequences_all[i])
+        emp_probs.append(emp_probs_all[i])
+        emp_dstrb.append(emp_cls_dstrbs[i][1]) 
+        
+        assert list(emp_cls_dstrbs[i][0])==sequences_all[i]
+
+target_distributions = emp_dstrb
+seq_probs = emp_probs
+
+
+global_weights = compute_global_weights(sequences, emp_probs)   
+training_sequences = sequences
+training_seq_probs = emp_probs
+
+
+  
+print(f"Number of training sequences: {len(sequences)}")
+print('Loaded from ',title )
+
+
+# -----------------------------------------------------------------
+# Location and name of trained encoder
+#------------------------------------------------------------------
+
+if monthly_data:
+    mFname = 'QMOD_'+symbol +'_'+date+'_'+predicted+'_'+predictor+'_'+ str(n_qubits)+'q'   
+
+    
+    print("Loading pre-trained encoder:",mFname )
+    # [model, sequences, emp_probs ]
+    encoder = pickle.load( open( mPath + mFname , "rb") )[0]
+    #model, sequences, emp_probs = result[0], result[1], result[2]
+    #encoder, meta=load_model_weights(mPath + model_file_name, m, n_qubits, learn_rho0=True, device="cpu")
+    # model test
+    #mod_seq_probs = predict_probs(encoder, sequences)
+    print("Loading pre-trained encoder:",mFname )
+else:
+    # QMOD_AAPL_20250303_log_mid_sigma_W_5q
+    mFname = 'QMOD_'+symbol+'_'+date+'_'+predicted+"_"+predictor+'_'+str(n_qubits)+'q'
+    print("Loading pre-trained encoder:",mFname )
+    encoder =  pickle.load( open( mPath + mFname, "rb") )[0]  #  [model, sequences, emp_probs ]       
+
+if not hasattr(encoder, "rho0_type"):
+    encoder.rho0_type = "mixed"
+
+
+#------------------------------------------------------------------------------
+# Validation Data
+#-------------------------------------------------------------------------------
+validation_sequences = None
+validation_targets = None
+validation_weights = None
+
+    
+#   #--------------------------------------------------------------------------
+# Joint Training Encoder-Decoder
+#--------------------------------------------------------------------------
+freeze_encoder = False                         #  train/no-train the encoder
+if freeze_encoder:
+    lambda_enc = 0.0                          #  weight for encoder loss
+    lambda_pred  = 1                          #  weight for prediction loss
+else:
+    lambda_enc = 0.02                          #  weight for encoder loss - 0.02
+    lambda_pred  = 0.98                        #  weight for prediction loss
+
+
+
+batch_size = 8*512
+epochs  = 300
+print("Training ","Freeze Encoder", freeze_encoder, "Weight encoder ", lambda_enc, "Weight Prediction",lambda_pred )
+
+gpu_id = 3
+device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu" 
+
+learn_rho0 = True
+device = "cuda" if torch.cuda.is_available() else "cpu"
+rho0_type = "mixed"  # or  "pure"
+
+# Initialize clean encoder
+encoder = KrausInstrument(
+    m=m, 
+    d=d, 
+    learn_rho0=learn_rho0,
+    rho0_type=rho0_type
+).to(device)
+
+# Verify initialization
+print(f"Clean Encoder initialized:")
+print(f"  Alphabet size (m): {encoder.m}")
+print(f"  System dimension (d): {encoder.d}")
+print(f"  Initial state type: {encoder.rho0_type}")
+print(f"  Learn ρ₀: {encoder.learn_rho0}")
+  
+
+# -----------------------------
+# Step 2: Prepare predictive dataset
+# -----------------------------
+print("\n" + "=" * 60)
+print("STEP 2: Preparing predictive dataset")
+print("=" * 60)
+
+
+
+# Load sequences with target labels
+# Each sequence is a prefix, target is the next symbol to predict
+# pred_sequences, pred_targets, pred_emp_probs = load_predictive_data()
+
+# Example: synthetic data for illustration
+# pred_sequences = [[0,1,2], [1,2,3], [2,3,4], ...]
+# pred_targets = [3, 4, 5, ...]  # next mid-price symbol
+# pred_emp_probs = [0.01, 0.015, 0.008, ...]
+
+
+# include class type in the class distibutions file name
+###########################################################################
+# Training can be done using individual or joint training data
+###########################################################################
+
+
+if monthly_data:
+    title = "CLS_DISTR_"+symbol+"_"+"_"+predicted+"-"+predictor+"_"+date+"_"+clsName
+    infname = fPath+title
+    
+    class_distributions =  pickle.load(open( infname, "rb") ) 
+    
+    print("Loaded:", title) 
+    sequences, target_distributions, seq_probs = integrate_data(class_distributions, distrs_samples)
+    
+    # calculate empirical weight of a sequence 
+    global_weights = compute_global_weights(sequences, emp_probs)
+
+    print(f"Number of unique sequences: {len(sequences)}")
+else:
     title = "CLS_DISTR_"+symbol+"_"+date+'_'+predicted+"_"+predictor+"_"+clsName
     infname = fPath+title
    
@@ -2819,11 +2733,218 @@ for clsName in clsNames:
     target_distributions = [d[1] for d in target_distributions]
     
     seq_probs = emp_probs
-    print("Loaded out of sample:", title) 
+    print("Loaded:", title) 
     
-    # Apply model out of sample      
-    mod_seq_probs, mod_target_distributions = get_model_predictions_ordered(pred_model, sequences)
 
-    
-    print("Out of Sample Report for ", date)
-    report( sequences, target_distributions, mod_target_distributions )    
+# calculate empirical weight of a sequence 
+global_weights = compute_global_weights(sequences, seq_probs)
+ 
+   
+# -----------------------------
+# Step 3: Train full predictive model
+# -----------------------------
+#prediction_loss in 'xEntropy', 'klDivergence', 'jsDivergence', 'mseError'"
+prediction_loss = 'mseError'
+print("\n" + "=" * 60)
+print("STEP 3: Training predictive model (encoder + decoder)",  predictor, predicted,"Loss=", prediction_loss, 'Class-=', clsName)
+print("Sequences Lengths", seq_lengths)
+print("=" * 60)
+
+d_out = 3  # prediction target dimension (e.g., 4 mid-price symbols)
+
+#   #--------------------------------------------------------------------------
+# Joint Training Encoder-Decoder
+#--------------------------------------------------------------------------
+freeze_encoder = False                         #  train/no-train the encoder
+if freeze_encoder:
+    lambda_enc = 0.0                          #  weight for encoder loss
+    lambda_pred  = 1                          #  weight for prediction loss
+else:
+    lambda_enc = 0.02                          #  weight for encoder loss - 0.02
+    lambda_pred  = 0.98                        #  weight for prediction loss
+
+batch_size = 8*512
+epochs  = 300
+print("Training ","Freeze Encoder", freeze_encoder, "Weight encoder ", lambda_enc, "Weight Prediction",lambda_pred )
+
+
+pred_model =  train_predictive_model_bilevel(
+sequences,             # list of sequences  
+target_distributions,  # sequence induced class distributions
+seq_probs,             # sequence probabilities wrt same length distributions
+global_weights,        # ← GLOBAL Empirical weights
+encoder = encoder,
+d_out=d_out,
+batch_size=batch_size,
+lr = 1e-3,
+epochs  = epochs,
+#freeze_encoder = True,
+freeze_encoder = freeze_encoder,
+use_unitary = True,
+device  = "cuda" if torch.cuda.is_available() else "cpu",
+optimizer_name = "adam",
+weight_decay = 1e-4,
+encoder_lr_multiplier = 0.1,
+lambda_enc = lambda_enc  ,   
+lambda_pred  = lambda_pred,  
+prediction_loss = prediction_loss,
+num_workers = 0,
+)
+
+# Save metadata
+
+meta = {
+'batch_size': batch_size,
+'epochs_trained': epochs,
+'lambda_enc': lambda_enc ,
+'lambda_pred':lambda_pred,
+'date'       :date, 
+'prediction_loss':prediction_loss,
+}
+
+
+#title = "PRD_" +str(class_type)+"_"+symbol+"_"+predicted+"-"+predictor+"_"+date+'_'+prediction_loss+'_'+str(n_qubits)+'q'
+title = "PRD_" +clsName+"_"+symbol+"_"+predicted+"-"+predictor+"_"+date+'_'+prediction_loss+'_'+str(n_qubits)+'q'
+save_file = mPath+title
+save_predictive_model(save_file, pred_model)
+print("Predictive Model saved as", save_file)
+
+# Load
+# pred_model_loaded, meta_loaded = load_predictive_model('pred_model_v1.pt', device='cuda')
+
+# print(f"Loaded model trained for {meta_loaded['epochs_trained']} epochs")
+# print(f"Final training loss: {meta_loaded['final_loss']}")
+
+# Use for inference
+# result = predict_from_sequence(pred_model_loaded, [0, 1, 2])
+
+
+#-----------------------------------------------------------------------------
+# Model Output - generative probabilities and class distributions for 
+
+# apply model for set of sequences
+
+#-------------------------------------------------------------------------------
+mod_seq_probs, mod_target_distributions = (
+    get_model_predictions_ordered(
+        pred_model,
+        sequences,
+    )
+)
+
+#divergences_by_length = compute_divergences_by_length(sequences,  target_distributions,  mod_target_distributions, divergence_type = "kl")
+plot_divergence_by_length(sequences, target_distributions, mod_target_distributions,  mod_seq_probs, emp_probs,
+    divergence_type = prediction_loss, figsize=(14, 6),
+    title="Performance: "+prediction_loss+" by Seq Length"
+)
+
+benchmark_loss = prediction_loss
+plot_divergence_by_length(sequences, target_distributions, mod_target_distributions,  
+                          mod_seq_probs, emp_probs,
+                          divergence_type = benchmark_loss, figsize=(14, 6),
+    title="Performance: "+benchmark_loss+" by Seq Length"
+)
+           
+
+# Performance Evaluation
+
+#-----------------------------------------------------------------------------
+# Model Output - generative probabilities and class distributions for 
+   
+report( sequences, target_distributions, mod_target_distributions )
+   
+# ---------------------------------------------------------------------        
+# Done with in-sample estimated
+# Read out of sample data ------------------------------------------------
+print('========================================================================')
+print('Out of sampe test: Training date', date,' Validation date', date_validation)
+print('========================================================================')
+
+#-----------------------------------------------------------------------------
+# Load sequences distributions -out of samples
+#----------------------------------------------------------------------------
+date = date_validation
+title = "SQ_PRB_"+symbol+"_"+date+"_"+predicted+"_"+predictor
+infname = fPath+title
+distrs_samples =  pickle.load(open( infname, "rb") ) # distrs_samples[0] - sequences toules, distrs_samples[1] - local probs
+print('Loaded Validation Sequence Disributions ', title) 
+#-----------------------------------------------------------
+# Load sequence CLASS distributions
+#-----------------------------------------------------------
+#Read out of sample class data
+title = "CLS_DISTR_"+symbol+"_"+date+'_'+predicted+"_"+predictor+"_"+clsName
+infname = fPath+title
+   
+target_distributions =  pickle.load(open( infname, "rb") )#[[(seq),[p0,p1,p2]]]
+
+print('Loaded Validation Class Disributions ', title) 
+
+emp_cls_dstrbs = target_distributions
+
+
+print('-----------------------------------------------------------------------')
+print('Validation for  max sequence length ',  max_seq_len)
+print('-----------------------------------------------------------------------')
+sequences = []
+emp_probs = []
+emp_dstrb = []
+
+sequences_all = distrs_samples[0]
+emp_probs_all = distrs_samples[1]
+
+
+for i in range(len(sequences_all)):
+    if len(sequences_all[i]) <= max_seq_len and emp_probs_all[i] > min_seq_prob:
+        sequences.append(list(sequences_all[i]))
+        emp_probs.append(emp_probs_all[i])
+        emp_dstrb.append(emp_cls_dstrbs[i][1]) 
+        
+        assert emp_cls_dstrbs[i][0]==sequences_all[i]
+
+       
+global_weights = compute_global_weights(sequences, emp_probs)   
+
+
+
+
+# Apply model out of sample      
+mod_seq_probs, mod_target_distributions = get_model_predictions_ordered(pred_model, sequences)
+        
+print("Out of Sample Report for ", date)
+report( sequences, emp_dstrb, mod_target_distributions )    
+
+
+print('---------------------------------------------------------------------')
+print('-----------------------------------------------------------------------')
+print('Validation for  max sequence length ',  max_seq_len-1)
+print('-----------------------------------------------------------------------')
+sequences = []
+emp_probs = []
+emp_dstrb = []
+
+sequences_all = distrs_samples[0]
+emp_probs_all = distrs_samples[1]
+
+
+for i in range(len(sequences_all)):
+    if len(sequences_all[i]) <= max_seq_len-1 and emp_probs_all[i] > min_seq_prob:
+        sequences.append(list(sequences_all[i]))
+        emp_probs.append(emp_probs_all[i])
+        emp_dstrb.append(emp_cls_dstrbs[i][1]) 
+        
+        assert emp_cls_dstrbs[i][0]==sequences_all[i]
+
+       
+global_weights = compute_global_weights(sequences, emp_probs)   
+
+
+
+
+# Apply model out of sample      
+mod_seq_probs, mod_target_distributions = get_model_predictions_ordered(pred_model, sequences)
+        
+print("Out of Sample Report for ", date)
+report( sequences, emp_dstrb, mod_target_distributions )         
+
+
+
