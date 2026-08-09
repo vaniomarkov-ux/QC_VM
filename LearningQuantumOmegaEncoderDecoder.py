@@ -4280,7 +4280,8 @@ d_out = nClasses
 # particular learning task parameters
 dates = ['202503','20250303','20250304', '20250401', '20250402' ]  # training and validation
 symbol= 'AAPL'
-
+symbol= 'INTC'
+symbol= 'NVDA'
 
 features     = ['log_mid',"tvi_n" , 'obi_L1', "ofi_L1_n", "ofi_L1_n_norm",'ofi_L1_norm_n','ofi_L3_norm_n','ofi_L10_norm_n',"micro_price",'vpin', 'sigma_W' ]
 features     = ['log_mid', "ofi_L1_n_norm",'ofi_L1_norm_n','ofi_L3_norm_n','ofi_L10_norm_n',"micro_price",'vpin', 'sigma_W' ]
@@ -4370,7 +4371,7 @@ if monthly_data:
     #   TEMP _Remove
     #--------------------------------------------------------------
     # title = "SQ_PRB_AAPL_20250303_log_mid_sigma_W"
-   
+    title = "SQ_PRB_NVDA_bivariate_log_mid-sigma_W_202503"
     #--------------------------------------------------------------
      
     infname = fPath+title
@@ -4393,6 +4394,7 @@ else:  # daily data
 #-----------------------------------------------------------------------------
 if monthly_data:     # CLS_DISTR_AAPL__log_mid-sigma_W_202503_ca4
     title = "CLS_DISTR_"+symbol+"_"+"_"+predicted+"-"+predictor+"_"+date+"_"+clsName
+    title = "CLS_DISTR_"+symbol+"_"+predicted+"-"+predictor+"_"+date+"_"+clsName
     infname = fPath+title
  
     #print(f"Number of unique sequences: {len(sequences)}")
@@ -4506,19 +4508,21 @@ if train_prediction_model:
         device=device,
     )[0] 
 
-    # Save metadata
-    meta = {
-        'batch_size': batch_size,
-        'epochs_trained': epochs,
-        'lambda_enc': lambda_enc ,
-        'lambda_pred':lambda_pred,
-        'date'       :date, 
-        'prediction_loss':prediction_loss,
-        }
-    
-    # save trained model              
-    save_predictive_model(save_model_file, pred_model, meta)
-    print("Predictive Model saved as", save_model_file)
+    save_prediction_model = False
+    if save_prediction_model:
+        # Save metadata
+        meta = {
+            'batch_size': batch_size,
+            'epochs_trained': epochs,
+            'lambda_enc': lambda_enc ,
+            'lambda_pred':lambda_pred,
+            'date'       :date, 
+            'prediction_loss':prediction_loss,
+            }
+        
+        # save trained model              
+        save_predictive_model(save_model_file, pred_model, meta)
+        print("Predictive Model saved as", save_model_file)
 else:                         #Load prediction model
     pred_model, meta = load_predictive_model(save_model_file, device='cpu')
     print("Predictive Model loaded from", save_model_file)
