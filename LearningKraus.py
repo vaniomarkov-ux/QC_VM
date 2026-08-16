@@ -426,8 +426,9 @@ def train(
             total += float(loss.detach().cpu()) * seq_pad.size(0)
             #
             n_seen += seq_pad.size(0)
-
-        print(f"epoch {ep:3d} | loss {total / max(n_seen,1):.6e}")
+        
+        if ep % 100 == 0:
+            print(f"epoch {ep:3d} | loss {total / max(n_seen,1):.6e}")
 
     return model
 #-----------------------------------------------------------------------------
@@ -452,10 +453,9 @@ def load_model_weights(path, m, n_qubits, learn_rho0=True, device="cpu"):
 #torch.set_num_interop_threads(1)  # usually best on CPU
 
 #-----------------------------------------------------------------------------
-fPath = 'C:\EXPIMP\Vanio\Projects\ICML-2026\Market Data Preparation\\' 
-fPath = ''
-fPath = 'C:\Vanio\Projects\ICML-2026\RepresentationStability\Data\\'
-fPath = 'C:\Vanio\Projects\ICML-2026\Learning\Data\\'
+
+fPath = '.\\data\\'
+mPath = '.\\models\\'
 
 dates = ['20250303','20250304', '20250305', '20250306', '20250307',
          '20250310','20250311', '20250312', '20250313', '20250314',
@@ -466,187 +466,178 @@ dates = ['20250303','20250304', '20250305', '20250306', '20250307',
 dates_march = ['20250303','20250304','20250305','20250306','20250307','20250310','20250311','20250312','20250313','20250314',
                '20250317','20250318','20250319','20250320','20250321','20250324','20250325','20250326','20250327','20250328','20250331']
 
-features_list =  ["log_mid_sym",'sigma_W_sym',"vpin_sym",'imbalance_sym',"mid_cross_prev_ask_up_sym", 
-                    'micro_price_sym',"trade_ofi_n_sym", "log_mid_return_fwd_1_sym"] 
-features_list =  ["log_mid",'sigma_W',"vpin",'imbalance',"mid_cross_prev_ask_up", 
-                    'micro_price',"trade_ofi_n", "log_mid_return_fwd_1"]
+
+features     = ['log_mid',"tvi_n", 'sigma_W', 'vpin','ofi_L1_norm_n','ofi_L3_norm_n','ofi_L10_norm_n', 'log_spread','imbalance']
+features     = ['log_mid','micro_price', 'vpin', 'ofi_L3_norm_n']
+features     = ['log_mid','micro_price', 'ofi_L3_norm_n']
+
+predicted = features[0]
+
 
 univariate = True
 univariate = False
+
+symbol= 'NVDA'
 symbol= 'AAPL'
 symbol= 'INTC'
-symbol= 'NVDA'
-date=dates[0]
+
 dates_march=['202503']
 
-data_format_1 = True
 
 for date in dates_march:
-    if univariate:
-    
-        feature = features_list[2]
-        n_symbols=8
+    for predictor in features[1:]:
+        print(50*'=')
+        print('Predictor',predictor,'Predicted',predicted,'Date',date)
+        print(50*'=')
+        if univariate:
         
-        frequency = 1 #sec
-        freq_units = 'sec'
+            feature = features[2]
+            n_symbols=8
+            
+            frequency = 1 #sec
+            freq_units = 'sec'
+            
+            frequency = 100 #events
+            freq_units = 'evn'
+            
+            max_seq_len =       6 #max sequence length to be used for training 
+            min_seq_prob = 0.000000 #threshold for rare events
+            
+            m = 8               # number of observable symbols  
+            n_qubits = 5        # size of system register
+            
+            # TD_AAPL_20250303_log_mid_sym_8ss_1sec
+            title = 'SQ_PRB_'+symbol+'_'+date
         
-        frequency = 100 #events
-        freq_units = 'evn'
-        
-        max_seq_len =       6 #max sequence length to be used for training 
-        min_seq_prob = 0.000000 #threshold for rare events
-        
-        m = 8               # number of observable symbols  
-        n_qubits = 5        # size of system register
-        
-        # TD_AAPL_20250303_log_mid_sym_8ss_1sec
-        if  data_format_1: 
-            title = 'TD_'+symbol+'_'+date+'_'+feature + '_'+str(n_symbols)+'ss_'+str(frequency)+freq_units
-        else:
-            title = 'SQ_PRB_WT_'+symbol+'_'+date
-    
-        infname = fPath+title
-        
-       
-        
-        if data_format_1:
+            infname = fPath+title
+            
             distrs_samples =  pickle.load(open( infname, "rb") )
+    
         else:
-            sequences, emp_probs, weights =  pickle.load(open( infname, "rb") )
-    else:
-        n_symbols=16
-        frequency = 1 #sec
-        freq_units = 'sec'
-       
-     
-        frequency = 100 #events
-        freq_units = 'evn'
+            n_symbols=16
+            frequency = 1 #sec
+            freq_units = 'sec'
+           
+         
+            frequency = 100 #events
+            freq_units = 'evn'            
+            max_seq_len =       6    # max sequence length to be used for training 
+            min_seq_prob = 0.0001    # threshold for rare events
+            
+            m = 16            # number of observable symbols  
+            n_qubits = 7     # size of system register
+           
+            
+            #predictor =  features[1]  # '
+    
+            
+            # Training data file
+            title = "SQ_PRB_"+symbol+'_'+predicted+'-'+predictor+'_'+date
+            
+            # Model file
+            save_file_name = 'QMOD_'+symbol+"_"+predicted+"-"+predictor+'_'+str(n_qubits)+'q_'+date
+            model_file_name = "WGHTS_"+save_file_name+'.pt'
+            
+            infname = fPath+title
+            
+            distrs_samples =  pickle.load(open( infname, "rb") ) 
+            sequences_all = distrs_samples[1]
+            emp_probs_all = [p[1]  for p in distrs_samples[0]]
+    
+    
+            sequences  = []
+            emp_probs  = []
+           
+            for i in range(len(sequences_all)):
+                if len(sequences_all[i])<=max_seq_len and emp_probs_all[i] > min_seq_prob :
+                    sequences.append(sequences_all[i])
+                    emp_probs.append(emp_probs_all[i])
         
-        max_seq_len =       6    # max sequence length to be used for training 
-        min_seq_prob = 0.000000   # threshold for rare events
+        print('Number of examples ', len(sequences))
         
-        m = 16            # number of observable symbols  
-        n_qubits = 5     # size of system register
-       
-        predicted =  features_list[7]  # "log_mid_return_fwd_1_sym"
-        predicted =  features_list[6]  # "vpin_sym"
-        
-        predicted =  features_list[0]  # "log_mid_sym"
-        predictor =  features_list[1]  # 'sigma_W_sym'
+        ds = SeqDataset(sequences, emp_probs)
         
         
-        predicted =  features_list[0]  # "log_mid_sym"
-        predictor =  features_list[1]  # 'sigma_W_sym'
-
+        continue_optimization = False
+        if continue_optimization:
+            save_file_name = 'MOD'+title[8:]+'_'+str(n_qubits)+'q'
+            model_file_name = "WGHTS_"+save_file_name+'.pt'
         
-        title = 'SQ_PRB_AAPL_20250331_log_mid_sigma_W'
-        # TD_AAPL_20250303_log_mid_sym_8ss_1sec
-        title = "TD_AAPL_20250303_imbalance_sym-log_mid_sum_ratio_1_sym_4ss_1sec"
-        title = "SQ_PRB_"+symbol+"_"+date+"_"+predicted+"_"+predictor
-        title = "SEQ_DISTR_AAPL_bivariate_log_mid-sigma_W_202503"
-        title = "SQ_PRB_INTC_bivariate_log_mid-sigma_W_202503"
-        title = "SQ_PRB_NVDA_bivariate_log_mid-sigma_W_202503"
+            modelM, meta = load_model_weights(model_file_name, m, n_qubits, learn_rho0=True, device="cpu")
+            print(meta)
+        else:
+            modelM = None
         
-        infname = fPath+title
+        epochs=5000
+        num_workers=8
+        gpu_id = '0'
+        model = train(ds.sequences, ds.emp_probs, max_seq_len,
+            m, n_qubits,
+            batch_size= 6*512, #4*512,
+            lr=1e-3,
+            epochs=epochs,
+            learn_rho0=True,
+            model=modelM,
+            num_workers=num_workers,
+            device="cuda:"+gpu_id if torch.cuda.is_available() else "cpu",
+            optimizer_name="adam", loss_kind="nll_seq")
+            #                    , loss_kind="mse_prob")
         
-        distrs_samples =  pickle.load(open( infname, "rb") ) 
-        sequences = distrs_samples[1]
-        emp_probs = distrs_samples[0]
-    if data_format_1:
-        sequences_all = distrs_samples[1]
-        emp_probs_all = [i[1] for i in distrs_samples[0]]
         
-        sequences = []
-        emp_probs = []
         
-        for i in range(len(sequences_all)):
-            if len(sequences_all[i])<=max_seq_len and emp_probs_all[i] > min_seq_prob :
-                sequences.append(sequences_all[i])
-                emp_probs.append(emp_probs_all[i])
+        def predict_probs(model, sequences, batch_size=2048, device=None):
+            """
+            sequences: list[list[int]] (ragged lengths allowed)
+            returns: list[float] probabilities in the same order
+            """
+            if device is None:
+                device = next(model.parameters()).device
+        
+            model.eval()
+            probs_out = []
+        
+            with torch.no_grad():
+                for i in range(0, len(sequences), batch_size):
+                    batch = sequences[i:i+batch_size]
+                    B = len(batch)
+                    T = max(len(s) for s in batch)
+        
+                    seq_pad = torch.full((B, T), PAD, dtype=torch.long, device=device)
+                    for j, s in enumerate(batch):
+                        seq_pad[j, :len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+        
+                    p = model.sequence_prob_batch(seq_pad)  # FloatTensor [B]
+                    probs_out.extend(p.detach().cpu().tolist())
+        
+            return probs_out
+        
+        
+        
+        
+        p_model = predict_probs(model, sequences, batch_size=2*1024)
+        
+        total_loss = 0
+        
+        for i in range(len(p_model)):
+            total_loss = total_loss+emp_probs[i]*(emp_probs[i]-p_model[i])**2
+        
+        #Kseq, rho0, p = model.path_operator(sequences_all[-1], return_prob=True, device="cpu")
+        
+        plotDistributions(emp_probs[:200],p_model[:200], sequences[:200],
+                          title[8:]+' Cost='+str(total_loss), 'Target', 'Model', c1 = 'blue', c2='red' )
+        
+        print('Completed:', total_loss)
+        print(title+'_'+str(n_qubits)+'q')
     
-    print('Number of examples ', len(sequences))
-    
-    ds = SeqDataset(sequences, emp_probs)
-    
-    
-    continue_optimization = False
-    if continue_optimization:
-        save_file_name = 'MOD'+title[8:]+'_'+str(n_qubits)+'q'
-        model_file_name = "WGHTS_"+save_file_name+'.pt'
-    
-        modelM, meta = load_model_weights(model_file_name, m, n_qubits, learn_rho0=True, device="cpu")
-        print(meta)
-    else:
-        modelM = None
-    
-    model = train(ds.sequences, ds.emp_probs, max_seq_len,
-        m, n_qubits,
-        batch_size= 6*512, #4*512,
-        lr=1e-3,
-        epochs=2000,
-        learn_rho0=True,
-        model=modelM,
-        num_workers=8,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        optimizer_name="adam", loss_kind="nll_seq")
-        #                    , loss_kind="mse_prob")
-    
-    
-    
-    def predict_probs(model, sequences, batch_size=2048, device=None):
-        """
-        sequences: list[list[int]] (ragged lengths allowed)
-        returns: list[float] probabilities in the same order
-        """
-        if device is None:
-            device = next(model.parameters()).device
-    
-        model.eval()
-        probs_out = []
-    
-        with torch.no_grad():
-            for i in range(0, len(sequences), batch_size):
-                batch = sequences[i:i+batch_size]
-                B = len(batch)
-                T = max(len(s) for s in batch)
-    
-                seq_pad = torch.full((B, T), PAD, dtype=torch.long, device=device)
-                for j, s in enumerate(batch):
-                    seq_pad[j, :len(s)] = torch.tensor(s, dtype=torch.long, device=device)
-    
-                p = model.sequence_prob_batch(seq_pad)  # FloatTensor [B]
-                probs_out.extend(p.detach().cpu().tolist())
-    
-        return probs_out
-    
-    
-    
-    
-    p_model = predict_probs(model, sequences, batch_size=2*1024)
-    
-    total_loss = 0
-    
-    for i in range(len(p_model)):
-        total_loss = total_loss+emp_probs[i]*(emp_probs[i]-p_model[i])**2
-    
-    #Kseq, rho0, p = model.path_operator(sequences_all[-1], return_prob=True, device="cpu")
-    
-    plotDistributions(emp_probs[:200],p_model[:200], sequences[:200],
-                      title[8:]+' Cost='+str(total_loss), 'Target', 'Model', c1 = 'blue', c2='red' )
-    
-    print('Completed:', total_loss)
-    print(title+'_'+str(n_qubits)+'q')
-    save_file_name = 'QMOD_'+symbol+"_"+date+"_"+predicted+"_"+predictor+'_'+str(n_qubits)+'q'
-    model_file_name = "WGHTS_"+save_file_name+'.pt'
-    
-    pickle.dump( [model, sequences, emp_probs ], open( save_file_name, "wb") )
-    
-    save_model_weights(
-        model_file_name,
-        model,
-        meta={"m": m, "n_qubits": n_qubits, "d": 2**n_qubits, "learn_rho0": True}
-    )            
-    print('Dumped', save_file_name, model_file_name)
-                
-                
-    
+        
+        pickle.dump( [model, sequences, emp_probs ], open( mPath+save_file_name, "wb") )
+        
+        save_model_weights(
+            mPath + model_file_name,
+            model,
+            meta={"m": m, "n_qubits": n_qubits, "d": 2**n_qubits, "learn_rho0": True}
+        )            
+        print('Dumped: Model, Weights', mPath, save_file_name, model_file_name)
+                    
+                    
+        
