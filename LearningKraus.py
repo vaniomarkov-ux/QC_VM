@@ -454,6 +454,9 @@ def load_model_weights(path, m, n_qubits, learn_rho0=True, device="cpu"):
 
 #-----------------------------------------------------------------------------
 
+fPath = '.\\data\\sequence_distributions\\'
+mPath = '.\\models\\Kraus Models\\'
+
 fPath = '.\\data\\'
 mPath = '.\\models\\'
 
@@ -469,42 +472,52 @@ dates_march = ['20250303','20250304','20250305','20250306','20250307','20250310'
 
 features     = ['log_mid',"tvi_n", 'sigma_W', 'vpin','ofi_L1_norm_n','ofi_L3_norm_n','ofi_L10_norm_n', 'log_spread','imbalance']
 features     = ['log_mid','micro_price', 'vpin', 'ofi_L3_norm_n']
-features     = ['log_mid','micro_price', 'ofi_L3_norm_n']
+features     = ['log_mid', 'ofi_L3_norm_n']
 
 predicted = features[0]
 
 
-univariate = True
-univariate = False
 
+variate = 'multivariate' # 'univariate', 'bivariate'
+variate =  'bivariate'
+if variate ==  'multivariate':
+    predictors_list = ["micro_vpin_ofi_l3"]  # just bbreviation to be used in the file name
+    predictors = features[1:]
+else:
+    predictors_list = features[1:]
+    
+symbol= 'AAPL'    
 symbol= 'NVDA'
-symbol= 'AAPL'
 symbol= 'INTC'
+
 
 dates_march=['202503']
 
+            # resampling 
+frequency = 1 #sec
+freq_units = 'sec'
+
+frequency = 100 #events
+freq_units = 'evn'
+
+
 
 for date in dates_march:
-    for predictor in features[1:]:
+    for predictor in predictors_list:
         print(50*'=')
         print('Predictor',predictor,'Predicted',predicted,'Date',date)
         print(50*'=')
-        if univariate:
+        if variate == 'univariate':
         
             feature = features[2]
             n_symbols=8
             
-            frequency = 1 #sec
-            freq_units = 'sec'
-            
-            frequency = 100 #events
-            freq_units = 'evn'
             
             max_seq_len =       6 #max sequence length to be used for training 
             min_seq_prob = 0.000000 #threshold for rare events
             
             m = 8               # number of observable symbols  
-            n_qubits = 5        # size of system register
+            n_qubits = 7        # size of system register
             
             # TD_AAPL_20250303_log_mid_sym_8ss_1sec
             title = 'SQ_PRB_'+symbol+'_'+date
@@ -513,46 +526,62 @@ for date in dates_march:
             
             distrs_samples =  pickle.load(open( infname, "rb") )
     
-        else:
+        elif variate == 'bivariate':
             n_symbols=16
-            frequency = 1 #sec
-            freq_units = 'sec'
-           
-         
-            frequency = 100 #events
-            freq_units = 'evn'            
             max_seq_len =       6    # max sequence length to be used for training 
             min_seq_prob = 0.0001    # threshold for rare events
             
             m = 16            # number of observable symbols  
-            n_qubits = 7     # size of system register
+            n_qubits = 7    # size of system register
            
             
             #predictor =  features[1]  # '
-    
-            
-            # Training data file
-            title = "SQ_PRB_"+symbol+'_'+predicted+'-'+predictor+'_'+date
-            
-            # Model file
-            save_file_name = 'QMOD_'+symbol+"_"+predicted+"-"+predictor+'_'+str(n_qubits)+'q_'+date
-            model_file_name = "WGHTS_"+save_file_name+'.pt'
-            
-            infname = fPath+title
-            
-            distrs_samples =  pickle.load(open( infname, "rb") ) 
-            sequences_all = distrs_samples[1]
-            emp_probs_all = [p[1]  for p in distrs_samples[0]]
-    
-    
-            sequences  = []
-            emp_probs  = []
-           
-            for i in range(len(sequences_all)):
-                if len(sequences_all[i])<=max_seq_len and emp_probs_all[i] > min_seq_prob :
-                    sequences.append(sequences_all[i])
-                    emp_probs.append(emp_probs_all[i])
         
+        elif variate == 'multivariate':
+            n_symbols = 4   # observable symbols per sequence
+            n_sequences = 4 # number of sequences - predicted + predictors
+            
+            
+            
+            max_seq_len =  5          # max sequence length to be used for training 
+            min_seq_prob = 0.0001   # threshold for rare events
+            
+            m = n_symbols**n_sequences            # number of observable symbols  
+            n_qubits = 5                         # size of system register
+            
+            # system dimension >= sqrt(#Kraus operatyors) 
+            
+           
+            predicted =  features[0]  # 'log_mid_sym'
+
+            
+        # SEQ_DISTR_AAPL_multivariate_log_mid-ofi_L10_norm_n-vpin_202504
+
+
+        # Training data file
+        title = "SQ_PRB_"+symbol+'_'+predicted+'-'+predictor+'_'+date
+        
+        # Model file
+        save_file_name = 'QMOD_'+symbol+"_"+predicted+"-"+predictor+'_'+str(n_qubits)+'q_'+date
+        model_file_name = "WGHTS_"+save_file_name+'.pt'
+        
+        infname = fPath+title
+        
+        distrs_samples =  pickle.load(open( infname, "rb") ) 
+        sequences_all = distrs_samples[1]
+        emp_probs_all = [p[1]  for p in distrs_samples[0]]
+        print('Training examples', title)
+        print('Models to',save_file_name)
+
+        sequences  = []
+        emp_probs  = []
+       
+        for i in range(len(sequences_all)):
+            if len(sequences_all[i])<=max_seq_len and emp_probs_all[i] > min_seq_prob :
+                sequences.append(sequences_all[i])
+                emp_probs.append(emp_probs_all[i])
+            
+            
         print('Number of examples ', len(sequences))
         
         ds = SeqDataset(sequences, emp_probs)
